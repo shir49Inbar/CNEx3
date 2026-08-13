@@ -589,7 +589,7 @@ Therefore every output element must be 10.
 ### Lines 303-340: create TCP listener
 
 - Converts the numeric port to text for `getaddrinfo()`.
-- Requests an IPv4 or IPv6 passive TCP address.
+- Requests an IPv4 passive TCP address, matching the exercise hosts.
 - Tries all returned addresses.
 - Enables address reuse.
 - Binds and starts listening.
@@ -597,7 +597,7 @@ Therefore every output element must be 10.
 
 ### Lines 341-385: connect to the next rank
 
-- Resolves the next hostname and port.
+- Resolves the next hostname and port over IPv4.
 - Tries every returned address.
 - Retries for approximately 30 seconds because processes may start at slightly
   different times.

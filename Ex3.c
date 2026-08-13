@@ -303,7 +303,7 @@ static int set_tcp_nodelay(int fd)
 static int create_listener(int port)
 {
     struct addrinfo hints = {
-        .ai_family = AF_UNSPEC,
+        .ai_family = AF_INET,
         .ai_socktype = SOCK_STREAM,
         .ai_flags = AI_PASSIVE
     };
@@ -341,7 +341,7 @@ static int create_listener(int port)
 static int connect_retry(const char *host, int port)
 {
     struct addrinfo hints = {
-        .ai_family = AF_UNSPEC,
+        .ai_family = AF_INET,
         .ai_socktype = SOCK_STREAM
     };
     struct addrinfo *results = NULL;
