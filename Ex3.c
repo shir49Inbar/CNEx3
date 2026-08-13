@@ -618,12 +618,12 @@ static int create_verbs_resources(pg_handle_t *handle)
         modify_qp_to_init(handle->rx_qp, handle->ib_port))
         return -1;
 
-    if (posix_memalign(&handle->scratch, 4096, handle->pipeline_bytes))
+    if (posix_memalign(&handle->scratch, 4096, handle->pipeline_bytes * 2))
         return report_error("could not allocate the pipeline scratch buffer");
-    memset(handle->scratch, 0, handle->pipeline_bytes);
+    memset(handle->scratch, 0, handle->pipeline_bytes * 2);
 
     handle->scratch_mr =
-        ibv_reg_mr(handle->pd, handle->scratch, handle->pipeline_bytes,
+        ibv_reg_mr(handle->pd, handle->scratch, handle->pipeline_bytes * 2,
                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!handle->scratch_mr)
         return report_errno("ibv_reg_mr(scratch)");
@@ -1013,20 +1013,25 @@ static int reduce_scatter_phase(pg_handle_t *handle, void *buffer,
                 make_tag(PHASE_REDUCE_SCATTER, (unsigned)step,
                          (unsigned)block);
             bool send_completed = false;
+            size_t scratch_offset =
+                (((size_t)step * block_count + block) & 1U) *
+                handle->pipeline_bytes;
 
             if (outgoing > handle->pipeline_bytes)
                 outgoing = handle->pipeline_bytes;
             if (incoming > handle->pipeline_bytes)
                 incoming = handle->pipeline_bytes;
 
-            if (post_receive(handle, tag, handle->scratch, incoming,
+            if (post_receive(handle, tag,
+                             (uint8_t *)handle->scratch + scratch_offset,
+                             incoming,
                              handle->scratch_mr, eager) ||
                 post_transfer(handle, tag,
                               outgoing
                                   ? (uint8_t *)buffer + send_base + block_offset
                                   : buffer,
                               outgoing, buffer_mr, eager,
-                              handle->next_rx.scratch_addr,
+                              handle->next_rx.scratch_addr + scratch_offset,
                               handle->next_rx.scratch_rkey) ||
                 wait_for_receive(handle, tag, &send_completed))
                 return -1;
@@ -1037,7 +1042,8 @@ static int reduce_scatter_phase(pg_handle_t *handle, void *buffer,
              */
             if (incoming &&
                 reduce_values((uint8_t *)buffer + receive_base + block_offset,
-                              handle->scratch, incoming / element_size,
+                              (uint8_t *)handle->scratch + scratch_offset,
+                              incoming / element_size,
                               datatype, operation))
                 return -1;
 

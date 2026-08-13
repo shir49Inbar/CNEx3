@@ -3,7 +3,7 @@
 This document explains the communication concepts, the program structure, how
 to build and run the exercise, and every part of `Ex3.c`. Adjacent source lines
 that perform one operation are grouped together so that the walkthrough remains
-readable. The ranges cover the complete file from line 1 through line 1642.
+readable. The ranges cover the complete file from line 1 through line 1648.
 
 ## 1. What the program implements
 
@@ -21,7 +21,8 @@ Every process has:
   previous process.
 - A TCP connection to each neighbor for setup, barriers, and exchanging memory
   registration information.
-- A registered scratch buffer used by the rendezvous reduce-scatter phase.
+- A registered two-slot scratch buffer used by the rendezvous reduce-scatter
+  phase.
 
 The program implements:
 
@@ -677,7 +678,7 @@ Therefore every output element must be 10.
 - Creates one completion queue.
 - Creates `tx_qp` and `rx_qp`, both using that CQ.
 - Moves both QPs to INIT.
-- Allocates a page-aligned scratch buffer.
+- Allocates a page-aligned, two-slot scratch buffer.
 - Registers the scratch memory for local and remote writes.
 
 ### Lines 634-641: generate packet sequence number
@@ -780,7 +781,7 @@ Therefore every output element must be 10.
 - Forced rendezvous always returns false.
 - Automatic mode compares total bytes with the eager threshold.
 
-### Lines 967-1050: internal reduce-scatter phase
+### Lines 967-1056: internal reduce-scatter phase
 
 - Calculates element size, maximum chunk size, and number of pipeline blocks.
 - Iterates through `size - 1` ring steps.
@@ -790,13 +791,15 @@ Therefore every output element must be 10.
 - Uses zero-byte immediate messages when a short uneven chunk has no data in a
   later block.
 - Posts receive before send to provide a receive work request.
+- Alternates between two scratch slots so a following RDMA write cannot
+  overwrite a block that the CPU is still reducing.
 - Eager receives into scratch through an SGE.
 - Rendezvous writes directly into the registered scratch buffer.
 - Waits for the incoming completion.
 - Reduces the scratch block into the correct partial chunk.
 - Waits for the outgoing completion only if it was not already observed.
 
-### Lines 1051-1137: internal all-gather phase
+### Lines 1057-1143: internal all-gather phase
 
 - Calculates pipeline geometry.
 - Exchanges output MR descriptors for rendezvous.
@@ -807,13 +810,13 @@ Therefore every output element must be 10.
 - Drains both completions for every block.
 - Performs no reduction because all chunks are already fully reduced.
 
-### Lines 1138-1152: register collective output
+### Lines 1144-1158: register collective output
 
 - Ensures that even a zero-count call registers one valid byte.
 - Registers the buffer for local and remote writes.
 - Returns the MR or reports the registration failure.
 
-### Lines 1153-1201: public `pg_all_reduce`
+### Lines 1159-1207: public `pg_all_reduce`
 
 - Validates pointers, count, datatype, and multiplication overflow.
 - Calculates total bytes and selects a protocol.
@@ -826,7 +829,7 @@ Therefore every output element must be 10.
 - Deregisters the MR.
 - Uses a final barrier before returning.
 
-### Lines 1202-1259: public `pg_reduce_scatter`
+### Lines 1208-1265: public `pg_reduce_scatter`
 
 - Uses standard equal per-rank receive counts.
 - Calculates the total send count as `recv_count * size`.
@@ -836,7 +839,7 @@ Therefore every output element must be 10.
 - Copies this rank's final reduced chunk into the caller's `recvbuf`.
 - Deregisters and frees temporary resources.
 
-### Lines 1260-1306: public `pg_all_gather`
+### Lines 1266-1312: public `pg_all_gather`
 
 - Uses a standard equal per-rank send count.
 - Calculates the complete receive count.
@@ -845,7 +848,7 @@ Therefore every output element must be 10.
 - Starts the all-gather phase with `owned_chunk == rank`.
 - Deregisters the output MR and synchronizes before returning.
 
-### Lines 1307-1338: `pg_close`
+### Lines 1313-1344: `pg_close`
 
 - Safely accepts a null handle.
 - Closes listener and control sockets.
@@ -859,27 +862,27 @@ Therefore every output element must be 10.
 The order is important: QPs and registered memory must be cleaned up before
 their parent PD and device context.
 
-### Lines 1339-1348: benchmark options structure
+### Lines 1345-1355: benchmark options structure
 
 - Stores all command-line choices used by `main()`.
 
-### Lines 1350-1363: usage text
+### Lines 1356-1369: usage text
 
 - Prints the exercise syntax, the alternative syntax, and optional arguments.
 
-### Lines 1364-1376: checked CLI integer parser
+### Lines 1370-1382: checked CLI integer parser
 
 - Converts a decimal argument with `strtol()`.
 - Rejects invalid characters, negative values when forbidden, and values larger
   than `INT32_MAX`.
 
-### Lines 1377-1411: exercise host-list parser
+### Lines 1383-1417: exercise host-list parser
 
 - Collects the space-separated hosts following `-list`.
 - Converts them into the comma-separated representation used by the API.
 - Keeps the allocated list alive until the program exits.
 
-### Lines 1412-1479: command-line parser
+### Lines 1418-1485: command-line parser
 
 - Installs default count, iteration count, datatype, operation, and protocol.
 - Walks through every argument.
@@ -889,37 +892,37 @@ their parent PD and device context.
 - Requires rank and host list.
 - Rejects unknown or incomplete options.
 
-### Lines 1480-1487: count hosts
+### Lines 1486-1493: count hosts
 
 - Counts commas and adds one to determine the number of ranks for the benchmark.
 
-### Lines 1488-1496: benchmark datatype size
+### Lines 1494-1502: benchmark datatype size
 
 - Returns the allocation size for the selected benchmark type.
 
-### Lines 1497-1514: initialize test input
+### Lines 1503-1520: initialize test input
 
 - Fills every local element with `rank + 1`.
 - Uses a correctly typed pointer for each datatype.
 
-### Lines 1515-1531: calculate expected test result
+### Lines 1521-1537: calculate expected test result
 
 - Sum uses the arithmetic-series formula.
 - Maximum is the number of ranks.
 - Minimum is one.
 - Product multiplies the values from 1 through the number of ranks.
 
-### Lines 1532-1554: verify output
+### Lines 1538-1560: verify output
 
 - Converts each result element to `double` for comparison.
 - Uses a small relative tolerance for floating-point values.
 - Reports the first incorrect element.
 
-### Lines 1555-1561: elapsed time
+### Lines 1561-1567: elapsed time
 
 - Converts two monotonic timestamps into a fractional number of seconds.
 
-### Lines 1562-1642: `main`
+### Lines 1568-1648: `main`
 
 - Parses arguments.
 - Validates that rank is inside the host list.
