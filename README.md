@@ -30,24 +30,25 @@ make
 
 The ordered host list defines the ring. Start one process per rank using the
 same host list. TCP port `18515 + rank` is used for bootstrap and control.
+The exercise syntax uses one-based `-myindex` values.
 
 Two ranks:
 
 ```sh
 # host rdma0
-./ex3 --rank 0 --hosts rdma0,rdma1 --count 1048576 --protocol rendezvous
+./test -myindex 01 -list rdma0 rdma1 --count 1048576 --protocol rendezvous
 
 # host rdma1
-./ex3 --rank 1 --hosts rdma0,rdma1 --count 1048576 --protocol rendezvous
+./test -myindex 02 -list rdma0 rdma1 --count 1048576 --protocol rendezvous
 ```
 
 Four ranks:
 
 ```sh
-./ex3 --rank 0 --hosts rdma0,rdma1,rdma2,rdma3 --protocol eager
-./ex3 --rank 1 --hosts rdma0,rdma1,rdma2,rdma3 --protocol eager
-./ex3 --rank 2 --hosts rdma0,rdma1,rdma2,rdma3 --protocol eager
-./ex3 --rank 3 --hosts rdma0,rdma1,rdma2,rdma3 --protocol eager
+./test -myindex 01 -list rdma0 rdma1 rdma2 rdma3 --protocol eager
+./test -myindex 02 -list rdma0 rdma1 rdma2 rdma3 --protocol eager
+./test -myindex 03 -list rdma0 rdma1 rdma2 rdma3 --protocol eager
+./test -myindex 04 -list rdma0 rdma1 rdma2 rdma3 --protocol eager
 ```
 
 Use identical `--count`, `--datatype`, `--op`, `--protocol`, and
@@ -71,8 +72,9 @@ set `PG_GID_INDEX` to the correct local GID table index on every host.
 ## Public API
 
 The API, implementation, and benchmark program are all in `Ex3.c`.
-`connect_process_group()` accepts the ordered comma-separated host list and
-reads this process's rank from `PG_RANK`.
+The exercise CLI converts its one-based index and space-separated host list
+into the `PG_RANK` and comma-separated list used by
+`connect_process_group()`.
 
 `pg_reduce_scatter()` and `pg_all_gather()` use equal per-rank counts.
 `pg_all_reduce()` accepts any total count, including counts not divisible by

@@ -983,9 +983,9 @@ static int reduce_scatter_phase(pg_handle_t *handle, void *buffer,
 
     for (int step = 0; step < handle->size - 1; ++step) {
         int send_chunk =
-            (handle->rank - step + handle->size) % handle->size;
-        int receive_chunk =
             (handle->rank - step - 1 + handle->size) % handle->size;
+        int receive_chunk =
+            (handle->rank - step - 2 + 2 * handle->size) % handle->size;
         size_t send_bytes =
             chunk_count(total_count, handle->size, send_chunk) *
             element_size;
@@ -1182,7 +1182,7 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                              recv_mr, eager))
         goto out;
 
-    owned_chunk = (handle->rank + 1) % handle->size;
+    owned_chunk = handle->rank;
     if (all_gather_phase(handle, recvbuf, count, datatype, recv_mr,
                          eager, owned_chunk))
         goto out;
@@ -1238,7 +1238,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int recv_count,
                              work_mr, eager))
         goto out;
 
-    owned_chunk = (handle->rank + 1) % handle->size;
+    owned_chunk = handle->rank;
     if (recv_count)
         memcpy(recvbuf,
                (uint8_t *)work +
@@ -1339,6 +1339,7 @@ int pg_close(void *pg_handle)
 typedef struct {
     int rank;
     const char *hosts;
+    char *owned_hosts;
     int count;
     int iterations;
     DATATYPE datatype;
@@ -1349,14 +1350,15 @@ typedef struct {
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "Usage: %s --rank N --hosts h0,h1[,h2,h3] [options]\n"
+            "Usage: %s -myindex N -list h1 h2 [h3 h4] [options]\n"
+            "   or: %s --rank N --hosts h0,h1[,h2,h3] [options]\n"
             "Options:\n"
             "  --count N             Elements per all-reduce (default 1048576)\n"
             "  --iterations N        Timed iterations (default 20)\n"
             "  --datatype TYPE       int, float, or double (default int)\n"
             "  --op OPERATION        sum, prod, max, or min (default sum)\n"
             "  --protocol PROTOCOL   eager, rendezvous, or auto (default auto)\n",
-            program);
+            program, program);
 }
 
 static int parse_int(const char *text, int minimum, int *value)
@@ -1369,6 +1371,41 @@ static int parse_int(const char *text, int minimum, int *value)
     if (errno || !end || *end || parsed < minimum || parsed > INT32_MAX)
         return -1;
     *value = (int)parsed;
+    return 0;
+}
+
+static int parse_host_list(int argc, char **argv, int *index,
+                           options_t *options)
+{
+    int first = *index + 1;
+    int end = first;
+    size_t length = 1;
+    char *hosts;
+    char *cursor;
+
+    while (end < argc && argv[end][0] != '-') {
+        length += strlen(argv[end]) + 1;
+        ++end;
+    }
+    if (end == first)
+        return -1;
+
+    hosts = malloc(length);
+    if (!hosts)
+        return -1;
+
+    cursor = hosts;
+    for (int i = first; i < end; ++i) {
+        size_t host_length = strlen(argv[i]);
+        memcpy(cursor, argv[i], host_length);
+        cursor += host_length;
+        *cursor++ = i + 1 < end ? ',' : '\0';
+    }
+
+    free(options->owned_hosts);
+    options->owned_hosts = hosts;
+    options->hosts = hosts;
+    *index = end - 1;
     return 0;
 }
 
@@ -1387,8 +1424,17 @@ static int parse_options(int argc, char **argv, options_t *options)
         if (!strcmp(argv[i], "--rank") && i + 1 < argc) {
             if (parse_int(argv[++i], 0, &options->rank))
                 return -1;
+        } else if (!strcmp(argv[i], "-myindex") && i + 1 < argc) {
+            if (parse_int(argv[++i], 1, &options->rank))
+                return -1;
+            --options->rank;
         } else if (!strcmp(argv[i], "--hosts") && i + 1 < argc) {
+            free(options->owned_hosts);
+            options->owned_hosts = NULL;
             options->hosts = argv[++i];
+        } else if (!strcmp(argv[i], "-list")) {
+            if (parse_host_list(argc, argv, &i, options))
+                return -1;
         } else if (!strcmp(argv[i], "--count") && i + 1 < argc) {
             if (parse_int(argv[++i], 0, &options->count))
                 return -1;
@@ -1527,6 +1573,7 @@ int main(int argc, char **argv)
 
     if (parse_options(argc, argv, &options)) {
         usage(argv[0]);
+        free(options.owned_hosts);
         return EXIT_FAILURE;
     }
 
@@ -1590,5 +1637,6 @@ out:
     pg_close(handle);
     free(receive_buffer);
     free(send_buffer);
+    free(options.owned_hosts);
     return result;
 }

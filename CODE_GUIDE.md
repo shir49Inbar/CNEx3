@@ -3,7 +3,7 @@
 This document explains the communication concepts, the program structure, how
 to build and run the exercise, and every part of `Ex3.c`. Adjacent source lines
 that perform one operation are grouped together so that the walkthrough remains
-readable. The ranges cover the complete file from line 1 through line 1594.
+readable. The ranges cover the complete file from line 1 through line 1642.
 
 ## 1. What the program implements
 
@@ -198,15 +198,14 @@ Each rank starts with a complete input array. During each of `P - 1` steps:
 The chunk indexes are:
 
 ```c
-send_chunk = (rank - step + size) % size;
-receive_chunk = (rank - step - 1 + size) % size;
+send_chunk = (rank - step - 1 + size) % size;
+receive_chunk = (rank - step - 2 + 2 * size) % size;
 ```
 
-After `P - 1` steps, each rank owns one completely reduced chunk. With the
-indexing used here, rank `r` owns:
+After `P - 1` steps, each rank owns its conventional reduce-scatter chunk:
 
 ```c
-(r + 1) % size
+r
 ```
 
 ### 4.2 All-gather
@@ -314,9 +313,10 @@ gcc -O2 -g -std=gnu11 -Wall -Wextra -Wpedantic \
     Ex3.c -o ex3 -libverbs -lm
 ```
 
-The result is the executable:
+The result includes the exercise-named executable and the original name:
 
 ```text
+./test
 ./ex3
 ```
 
@@ -352,7 +352,7 @@ Assume the machines are named `rdma0` and `rdma1`.
 On `rdma0`:
 
 ```sh
-./ex3 --rank 0 --hosts rdma0,rdma1 \
+./test -myindex 01 -list rdma0 rdma1 \
     --count 1048576 --datatype int --op sum \
     --protocol eager --iterations 20
 ```
@@ -360,7 +360,7 @@ On `rdma0`:
 On `rdma1`:
 
 ```sh
-./ex3 --rank 1 --hosts rdma0,rdma1 \
+./test -myindex 02 -list rdma0 rdma1 \
     --count 1048576 --datatype int --op sum \
     --protocol eager --iterations 20
 ```
@@ -378,25 +378,25 @@ Use the identical ordered host list on all four machines.
 On `rdma0`:
 
 ```sh
-./ex3 --rank 0 --hosts rdma0,rdma1,rdma2,rdma3 --protocol rendezvous
+./test -myindex 01 -list rdma0 rdma1 rdma2 rdma3 --protocol rendezvous
 ```
 
 On `rdma1`:
 
 ```sh
-./ex3 --rank 1 --hosts rdma0,rdma1,rdma2,rdma3 --protocol rendezvous
+./test -myindex 02 -list rdma0 rdma1 rdma2 rdma3 --protocol rendezvous
 ```
 
 On `rdma2`:
 
 ```sh
-./ex3 --rank 2 --hosts rdma0,rdma1,rdma2,rdma3 --protocol rendezvous
+./test -myindex 03 -list rdma0 rdma1 rdma2 rdma3 --protocol rendezvous
 ```
 
 On `rdma3`:
 
 ```sh
-./ex3 --rank 3 --hosts rdma0,rdma1,rdma2,rdma3 --protocol rendezvous
+./test -myindex 04 -list rdma0 rdma1 rdma2 rdma3 --protocol rendezvous
 ```
 
 The program uses a default count of 1,048,576 integers and 20 timed iterations
@@ -406,8 +406,10 @@ when those options are omitted.
 
 | Option | Meaning |
 | --- | --- |
-| `--rank N` | This process's zero-based index |
-| `--hosts LIST` | Ordered comma-separated host list |
+| `-myindex N` | This process's one-based exercise index |
+| `-list HOST...` | Ordered space-separated host list |
+| `--rank N` | Alternative zero-based process index |
+| `--hosts LIST` | Alternative comma-separated host list |
 | `--count N` | Number of all-reduce elements |
 | `--iterations N` | Number of timed all-reduce calls |
 | `--datatype int` | Use C `int` elements |
@@ -860,55 +862,63 @@ their parent PD and device context.
 
 - Stores all command-line choices used by `main()`.
 
-### Lines 1349-1361: usage text
+### Lines 1350-1363: usage text
 
-- Prints the required options and all optional benchmark arguments.
+- Prints the exercise syntax, the alternative syntax, and optional arguments.
 
-### Lines 1362-1374: checked CLI integer parser
+### Lines 1364-1376: checked CLI integer parser
 
 - Converts a decimal argument with `strtol()`.
 - Rejects invalid characters, negative values when forbidden, and values larger
   than `INT32_MAX`.
 
-### Lines 1375-1433: command-line parser
+### Lines 1377-1411: exercise host-list parser
+
+- Collects the space-separated hosts following `-list`.
+- Converts them into the comma-separated representation used by the API.
+- Keeps the allocated list alive until the program exits.
+
+### Lines 1412-1479: command-line parser
 
 - Installs default count, iteration count, datatype, operation, and protocol.
 - Walks through every argument.
+- Converts one-based `-myindex` values to zero-based internal ranks.
+- Supports both the exercise syntax and the original long-option syntax.
 - Maps strings to enums.
 - Requires rank and host list.
 - Rejects unknown or incomplete options.
 
-### Lines 1434-1441: count hosts
+### Lines 1480-1487: count hosts
 
 - Counts commas and adds one to determine the number of ranks for the benchmark.
 
-### Lines 1442-1450: benchmark datatype size
+### Lines 1488-1496: benchmark datatype size
 
 - Returns the allocation size for the selected benchmark type.
 
-### Lines 1451-1468: initialize test input
+### Lines 1497-1514: initialize test input
 
 - Fills every local element with `rank + 1`.
 - Uses a correctly typed pointer for each datatype.
 
-### Lines 1469-1485: calculate expected test result
+### Lines 1515-1531: calculate expected test result
 
 - Sum uses the arithmetic-series formula.
 - Maximum is the number of ranks.
 - Minimum is one.
 - Product multiplies the values from 1 through the number of ranks.
 
-### Lines 1486-1508: verify output
+### Lines 1532-1554: verify output
 
 - Converts each result element to `double` for comparison.
 - Uses a small relative tolerance for floating-point values.
 - Reports the first incorrect element.
 
-### Lines 1509-1515: elapsed time
+### Lines 1555-1561: elapsed time
 
 - Converts two monotonic timestamps into a fractional number of seconds.
 
-### Lines 1516-1594: `main`
+### Lines 1562-1642: `main`
 
 - Parses arguments.
 - Validates that rank is inside the host list.

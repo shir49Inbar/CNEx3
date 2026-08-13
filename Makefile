@@ -5,10 +5,13 @@ LDLIBS += -libverbs -lm
 
 .PHONY: all clean
 
-all: ex3
+all: ex3 test
 
 ex3: Ex3.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
+test: ex3
+	ln -sf ex3 test
+
 clean:
-	$(RM) ex3
+	$(RM) ex3 test
