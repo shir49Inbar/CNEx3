@@ -58,7 +58,7 @@ Use identical `--count`, `--datatype`, `--op`, `--protocol`, and
 
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
-| `PG_BASE_PORT` | `18515` | TCP bootstrap base port |
+| `PG_BASE_PORT` | `20000 + UID % 40000` | TCP bootstrap base port |
 | `PG_DEVICE` | first device | libibverbs device name |
 | `PG_IB_PORT` | `1` | RDMA device port |
 | `PG_GID_INDEX` | `-1` | GID index; set for RoCE |

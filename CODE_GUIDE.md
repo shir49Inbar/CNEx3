@@ -427,7 +427,7 @@ when those options are omitted.
 
 | Variable | Default | Explanation |
 | --- | ---: | --- |
-| `PG_BASE_PORT` | `18515` | Rank `r` listens on this value plus `r` |
+| `PG_BASE_PORT` | `20000 + UID % 40000` | Rank `r` listens on this value plus `r` |
 | `PG_DEVICE` | First device | Name shown by `ibv_devices` |
 | `PG_IB_PORT` | `1` | Physical RDMA device port |
 | `PG_GID_INDEX` | `-1` | Negative means LID addressing; set for RoCE |
@@ -472,7 +472,8 @@ Therefore every output element must be 10.
 
 ### Lines 21-32: constants
 
-- **Line 21:** Default TCP bootstrap base port.
+- The default TCP bootstrap base port is derived from the user ID to avoid
+  collisions with other students on shared machines.
 - **Line 22:** Default physical RDMA port.
 - **Line 23:** Default GID index. `-1` selects LID-based InfiniBand addressing.
 - **Line 24:** Default boundary between eager and rendezvous.

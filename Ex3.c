@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEFAULT_BASE_PORT 18515
+#define DEFAULT_BASE_PORT (20000 + (int)(getuid() % 40000))
 #define DEFAULT_IB_PORT 1
 #define DEFAULT_GID_INDEX (-1)
 #define DEFAULT_EAGER_THRESHOLD 8192U
