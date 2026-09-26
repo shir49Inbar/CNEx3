@@ -26,18 +26,32 @@
 #define CONNECT_RETRIES 300
 #define MAX_QP_WR 128
 #define CQ_CAPACITY 512
+#define MAX_MR_CACHE 16
 
 #define WR_SEND_BIT (UINT64_C(1) << 63)
 #define PHASE_REDUCE_SCATTER 1U
 #define PHASE_ALL_GATHER 2U
 
-typedef enum {
+typedef struct
+{
+    void *addr;
+    size_t length;
+    struct ibv_mr *mr;
+
+    uint64_t remote_addr;
+    uint32_t remote_rkey;
+    bool has_remote;
+} mr_cache_entry_t;
+
+typedef enum
+{
     DATATYPE_INT,
     DATATYPE_FLOAT,
     DATATYPE_DOUBLE
 } DATATYPE;
 
-typedef enum {
+typedef enum
+{
     OP_SUM,
     OP_PROD,
     OP_MAX,
@@ -53,13 +67,15 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
                   DATATYPE datatype, OPERATION op, void *pg_handle);
 int pg_close(void *pg_handle);
 
-typedef enum {
+typedef enum
+{
     PROTOCOL_AUTO,
     PROTOCOL_EAGER,
     PROTOCOL_RENDEZVOUS
 } protocol_mode_t;
 
-typedef struct {
+typedef struct
+{
     uint32_t qpn;
     uint32_t psn;
     uint16_t lid;
@@ -69,7 +85,8 @@ typedef struct {
     uint32_t scratch_rkey;
 } qp_endpoint_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct __attribute__((packed))
+{
     uint32_t qpn;
     uint32_t psn;
     uint16_t lid;
@@ -79,12 +96,14 @@ typedef struct __attribute__((packed)) {
     uint32_t scratch_rkey;
 } qp_endpoint_wire_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct __attribute__((packed))
+{
     uint64_t addr;
     uint32_t rkey;
 } mr_wire_t;
 
-typedef struct {
+typedef struct
+{
     int rank;
     int size;
     char **hosts;
@@ -112,6 +131,13 @@ typedef struct {
     void *scratch;
     struct ibv_mr *scratch_mr;
     qp_endpoint_t next_rx;
+
+    void *rs_work_buf;
+    size_t rs_work_bytes;
+    struct ibv_mr *rs_work_mr;
+
+    mr_cache_entry_t mr_cache[MAX_MR_CACHE];
+    int mr_cache_count;
 } pg_handle_t;
 
 static uint64_t host_to_be64(uint64_t value)
@@ -152,7 +178,8 @@ static long env_long(const char *name, long default_value, long minimum,
 
     errno = 0;
     value = strtol(text, &end, 10);
-    if (errno || !end || *end || value < minimum || value > maximum) {
+    if (errno || !end || *end || value < minimum || value > maximum)
+    {
         fprintf(stderr, "ex3: invalid %s value '%s'\n", name, text);
         return default_value;
     }
@@ -176,7 +203,8 @@ static protocol_mode_t protocol_from_env(void)
 
 static size_t datatype_size(DATATYPE datatype)
 {
-    switch (datatype) {
+    switch (datatype)
+    {
     case DATATYPE_INT:
         return sizeof(int);
     case DATATYPE_FLOAT:
@@ -208,7 +236,8 @@ static int split_hosts(const char *host_list, char ***hosts_out, int *size_out)
         goto allocation_failure;
 
     for (token = strtok_r(copy, ",", &save); token;
-         token = strtok_r(NULL, ",", &save)) {
+         token = strtok_r(NULL, ",", &save))
+    {
         if (!*token || index == count)
             goto invalid_list;
         hosts[index] = strdup(token);
@@ -218,7 +247,8 @@ static int split_hosts(const char *host_list, char ***hosts_out, int *size_out)
     }
 
     free(copy);
-    if (index < 2) {
+    if (index < 2)
+    {
         for (int i = 0; i < index; ++i)
             free(hosts[i]);
         free(hosts);
@@ -259,9 +289,11 @@ static int send_all(int fd, const void *buffer, size_t length)
 {
     const uint8_t *cursor = buffer;
 
-    while (length) {
+    while (length)
+    {
         ssize_t written = send(fd, cursor, length, MSG_NOSIGNAL);
-        if (written < 0) {
+        if (written < 0)
+        {
             if (errno == EINTR)
                 continue;
             return report_errno("send");
@@ -278,9 +310,11 @@ static int recv_all(int fd, void *buffer, size_t length)
 {
     uint8_t *cursor = buffer;
 
-    while (length) {
+    while (length)
+    {
         ssize_t received = recv(fd, cursor, length, 0);
-        if (received < 0) {
+        if (received < 0)
+        {
             if (errno == EINTR)
                 continue;
             return report_errno("recv");
@@ -305,8 +339,7 @@ static int create_listener(int port)
     struct addrinfo hints = {
         .ai_family = AF_INET,
         .ai_socktype = SOCK_STREAM,
-        .ai_flags = AI_PASSIVE
-    };
+        .ai_flags = AI_PASSIVE};
     struct addrinfo *results = NULL;
     struct addrinfo *entry;
     char service[16];
@@ -314,12 +347,14 @@ static int create_listener(int port)
     int reuse = 1;
 
     snprintf(service, sizeof(service), "%d", port);
-    if (getaddrinfo(NULL, service, &hints, &results)) {
+    if (getaddrinfo(NULL, service, &hints, &results))
+    {
         report_error("getaddrinfo failed while creating listener");
         return -1;
     }
 
-    for (entry = results; entry; entry = entry->ai_next) {
+    for (entry = results; entry; entry = entry->ai_next)
+    {
         listener = socket(entry->ai_family, entry->ai_socktype,
                           entry->ai_protocol);
         if (listener < 0)
@@ -342,8 +377,7 @@ static int connect_retry(const char *host, int port)
 {
     struct addrinfo hints = {
         .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM
-    };
+        .ai_socktype = SOCK_STREAM};
     struct addrinfo *results = NULL;
     struct addrinfo *entry;
     char service[16];
@@ -351,15 +385,18 @@ static int connect_retry(const char *host, int port)
 
     snprintf(service, sizeof(service), "%d", port);
 
-    for (int attempt = 0; attempt < CONNECT_RETRIES; ++attempt) {
+    for (int attempt = 0; attempt < CONNECT_RETRIES; ++attempt)
+    {
         int gai_result = getaddrinfo(host, service, &hints, &results);
-        if (gai_result) {
+        if (gai_result)
+        {
             fprintf(stderr, "ex3: getaddrinfo(%s): %s\n", host,
                     gai_strerror(gai_result));
             return -1;
         }
 
-        for (entry = results; entry; entry = entry->ai_next) {
+        for (entry = results; entry; entry = entry->ai_next)
+        {
             fd = socket(entry->ai_family, entry->ai_socktype,
                         entry->ai_protocol);
             if (fd < 0)
@@ -372,7 +409,8 @@ static int connect_retry(const char *host, int port)
         freeaddrinfo(results);
         results = NULL;
 
-        if (fd >= 0) {
+        if (fd >= 0)
+        {
             set_tcp_nodelay(fd);
             return fd;
         }
@@ -386,7 +424,8 @@ static int connect_retry(const char *host, int port)
 static int accept_connection(int listener)
 {
     int fd;
-    do {
+    do
+    {
         fd = accept(listener, NULL, NULL);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
@@ -441,8 +480,7 @@ static int modify_qp_to_init(struct ibv_qp *qp, int ib_port)
         .qp_state = IBV_QPS_INIT,
         .port_num = (uint8_t)ib_port,
         .pkey_index = 0,
-        .qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
-    };
+        .qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ};
     int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                 IBV_QP_ACCESS_FLAGS;
 
@@ -467,14 +505,13 @@ static int modify_qp_to_rtr(pg_handle_t *handle, struct ibv_qp *qp,
             .dlid = remote->lid,
             .sl = 0,
             .src_path_bits = 0,
-            .port_num = (uint8_t)handle->ib_port
-        }
-    };
+            .port_num = (uint8_t)handle->ib_port}};
     int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                 IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                 IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
-    if (handle->gid_index >= 0) {
+    if (handle->gid_index >= 0)
+    {
         attr.ah_attr.is_global = 1;
         memcpy(&attr.ah_attr.grh.dgid, remote->gid,
                sizeof(attr.ah_attr.grh.dgid));
@@ -495,8 +532,7 @@ static int modify_qp_to_rts(struct ibv_qp *qp, uint32_t psn)
         .retry_cnt = 7,
         .rnr_retry = 7,
         .sq_psn = psn,
-        .max_rd_atomic = 1
-    };
+        .max_rd_atomic = 1};
     int flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                 IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                 IBV_QP_MAX_QP_RD_ATOMIC;
@@ -515,8 +551,7 @@ static qp_endpoint_t local_endpoint(const pg_handle_t *handle,
         .lid = handle->port_attr.lid,
         .mtu = (uint8_t)handle->port_attr.active_mtu,
         .scratch_addr = (uintptr_t)handle->scratch,
-        .scratch_rkey = handle->scratch_mr->rkey
-    };
+        .scratch_rkey = handle->scratch_mr->rkey};
     memcpy(endpoint.gid, handle->gid.raw, sizeof(endpoint.gid));
     return endpoint;
 }
@@ -561,23 +596,24 @@ static int create_verbs_resources(pg_handle_t *handle)
             .max_send_wr = MAX_QP_WR,
             .max_recv_wr = MAX_QP_WR,
             .max_send_sge = 1,
-            .max_recv_sge = 1
-        },
-        .qp_type = IBV_QPT_RC
-    };
+            .max_recv_sge = 1},
+        .qp_type = IBV_QPT_RC};
 
     devices = ibv_get_device_list(&device_count);
     if (!devices || !device_count)
         return report_error("no RDMA device is available");
 
-    for (int i = 0; i < device_count; ++i) {
+    for (int i = 0; i < device_count; ++i)
+    {
         if (!requested_device ||
-            !strcmp(requested_device, ibv_get_device_name(devices[i]))) {
+            !strcmp(requested_device, ibv_get_device_name(devices[i])))
+        {
             selected = devices[i];
             break;
         }
     }
-    if (!selected) {
+    if (!selected)
+    {
         ibv_free_device_list(devices);
         return report_error("PG_DEVICE does not name an available device");
     }
@@ -674,13 +710,15 @@ int connect_process_group(char *servername, void **pg_handle)
 
     if (split_hosts(servername, &handle->hosts, &handle->size))
         goto failure;
-    if (handle->size > 255) {
+    if (handle->size > 255)
+    {
         report_error("the immediate-data format supports at most 255 ranks");
         goto failure;
     }
 
     handle->rank = (int)env_long("PG_RANK", -1, -1, handle->size - 1);
-    if (handle->rank < 0) {
+    if (handle->rank < 0)
+    {
         report_error("PG_RANK must identify this process in the host list");
         goto failure;
     }
@@ -707,12 +745,15 @@ int connect_process_group(char *servername, void **pg_handle)
      * Rank zero breaks the ring handshake dependency. Every listener is
      * already active, so all TCP connects can complete before this ordering.
      */
-    if (handle->rank == 0) {
+    if (handle->rank == 0)
+    {
         handle->prev_sock = accept_connection(handle->listen_fd);
         if (handle->prev_sock < 0 || incoming_handshake(handle) ||
             outgoing_handshake(handle))
             goto failure;
-    } else {
+    }
+    else
+    {
         if (outgoing_handshake(handle))
             goto failure;
         handle->prev_sock = accept_connection(handle->listen_fd);
@@ -736,7 +777,8 @@ static int ring_barrier(pg_handle_t *handle)
     uint32_t release = htonl(UINT32_C(0x52454c53));
     uint32_t token;
 
-    if (handle->rank == 0) {
+    if (handle->rank == 0)
+    {
         if (send_all(handle->next_sock, &enter, sizeof(enter)) ||
             recv_all(handle->prev_sock, &token, sizeof(token)) ||
             token != enter ||
@@ -744,7 +786,9 @@ static int ring_barrier(pg_handle_t *handle)
             recv_all(handle->prev_sock, &token, sizeof(token)) ||
             token != release)
             return report_error("process-group barrier failed");
-    } else {
+    }
+    else
+    {
         if (recv_all(handle->prev_sock, &token, sizeof(token)) ||
             token != enter ||
             send_all(handle->next_sock, &token, sizeof(token)) ||
@@ -762,8 +806,7 @@ static int exchange_next_mr(pg_handle_t *handle, const struct ibv_mr *local,
 {
     mr_wire_t outgoing = {
         .addr = host_to_be64(local_addr),
-        .rkey = htonl(local->rkey)
-    };
+        .rkey = htonl(local->rkey)};
     mr_wire_t incoming;
 
     /*
@@ -799,33 +842,37 @@ static size_t chunk_offset(int total_count, int size, int chunk)
 static int reduce_values(void *destination, const void *source, size_t count,
                          DATATYPE datatype, OPERATION operation)
 {
-#define REDUCE_TYPED(type)                                                     \
-    do {                                                                       \
-        type *dst = destination;                                                \
-        const type *src = source;                                               \
-        for (size_t i = 0; i < count; ++i) {                                   \
-            switch (operation) {                                                \
-            case OP_SUM:                                                        \
-                dst[i] += src[i];                                               \
-                break;                                                         \
-            case OP_PROD:                                                       \
-                dst[i] *= src[i];                                               \
-                break;                                                         \
-            case OP_MAX:                                                        \
-                if (src[i] > dst[i])                                            \
-                    dst[i] = src[i];                                            \
-                break;                                                         \
-            case OP_MIN:                                                        \
-                if (src[i] < dst[i])                                            \
-                    dst[i] = src[i];                                            \
-                break;                                                         \
-            default:                                                           \
-                return -1;                                                      \
-            }                                                                  \
-        }                                                                      \
+#define REDUCE_TYPED(type)                 \
+    do                                     \
+    {                                      \
+        type *dst = destination;           \
+        const type *src = source;          \
+        for (size_t i = 0; i < count; ++i) \
+        {                                  \
+            switch (operation)             \
+            {                              \
+            case OP_SUM:                   \
+                dst[i] += src[i];          \
+                break;                     \
+            case OP_PROD:                  \
+                dst[i] *= src[i];          \
+                break;                     \
+            case OP_MAX:                   \
+                if (src[i] > dst[i])       \
+                    dst[i] = src[i];       \
+                break;                     \
+            case OP_MIN:                   \
+                if (src[i] < dst[i])       \
+                    dst[i] = src[i];       \
+                break;                     \
+            default:                       \
+                return -1;                 \
+            }                              \
+        }                                  \
     } while (0)
 
-    switch (datatype) {
+    switch (datatype)
+    {
     case DATATYPE_INT:
         REDUCE_TYPED(int);
         break;
@@ -850,13 +897,15 @@ static uint32_t make_tag(unsigned phase, unsigned step, unsigned block)
 
 static int poll_one(pg_handle_t *handle, struct ibv_wc *completion)
 {
-    for (;;) {
+    for (;;)
+    {
         int result = ibv_poll_cq(handle->cq, 1, completion);
         if (result < 0)
             return report_error("ibv_poll_cq failed");
         if (!result)
             continue;
-        if (completion->status != IBV_WC_SUCCESS) {
+        if (completion->status != IBV_WC_SUCCESS)
+        {
             fprintf(stderr, "ex3: work completion failed: %s (%d)\n",
                     ibv_wc_status_str(completion->status),
                     completion->status);
@@ -873,13 +922,11 @@ static int post_receive(pg_handle_t *handle, uint32_t tag, void *destination,
     struct ibv_sge sge = {
         .addr = (uintptr_t)destination,
         .length = (uint32_t)length,
-        .lkey = mr ? mr->lkey : 0
-    };
+        .lkey = mr ? mr->lkey : 0};
     struct ibv_recv_wr wr = {
         .wr_id = tag,
         .sg_list = eager && length ? &sge : NULL,
-        .num_sge = eager && length ? 1 : 0
-    };
+        .num_sge = eager && length ? 1 : 0};
     struct ibv_recv_wr *bad_wr = NULL;
 
     if (ibv_post_recv(handle->rx_qp, &wr, &bad_wr))
@@ -895,8 +942,7 @@ static int post_transfer(pg_handle_t *handle, uint32_t tag,
     struct ibv_sge sge = {
         .addr = (uintptr_t)source,
         .length = (uint32_t)length,
-        .lkey = source_mr ? source_mr->lkey : 0
-    };
+        .lkey = source_mr ? source_mr->lkey : 0};
     struct ibv_send_wr wr = {
         .wr_id = WR_SEND_BIT | tag,
         .sg_list = length ? &sge : NULL,
@@ -904,11 +950,16 @@ static int post_transfer(pg_handle_t *handle, uint32_t tag,
         .opcode = eager || !length ? IBV_WR_SEND_WITH_IMM
                                    : IBV_WR_RDMA_WRITE_WITH_IMM,
         .send_flags = IBV_SEND_SIGNALED,
-        .imm_data = htonl(tag)
-    };
+        .imm_data = htonl(tag)};
     struct ibv_send_wr *bad_wr = NULL;
 
-    if (!eager && length) {
+    if (eager && length > 0 && length <= 256)
+    {
+        wr.send_flags |= IBV_SEND_INLINE;
+    }
+
+    if (!eager && length)
+    {
         wr.wr.rdma.remote_addr = remote_addr;
         wr.wr.rdma.rkey = remote_rkey;
     }
@@ -923,11 +974,13 @@ static int wait_for_receive(pg_handle_t *handle, uint32_t tag,
 {
     struct ibv_wc completion;
 
-    for (;;) {
+    for (;;)
+    {
         if (poll_one(handle, &completion))
             return -1;
 
-        if (completion.wr_id & WR_SEND_BIT) {
+        if (completion.wr_id & WR_SEND_BIT)
+        {
             if ((uint32_t)(completion.wr_id & ~WR_SEND_BIT) != tag)
                 return report_error("unexpected send completion");
             *send_completed = true;
@@ -981,7 +1034,8 @@ static int reduce_scatter_phase(pg_handle_t *handle, void *buffer,
     if (block_count > UINT16_MAX)
         return report_error("PG_PIPELINE_BYTES creates too many blocks");
 
-    for (int step = 0; step < handle->size - 1; ++step) {
+    for (int step = 0; step < handle->size - 1; ++step)
+    {
         int send_chunk =
             (handle->rank - step - 1 + handle->size) % handle->size;
         int receive_chunk =
@@ -999,7 +1053,8 @@ static int reduce_scatter_phase(pg_handle_t *handle, void *buffer,
             chunk_offset(total_count, handle->size, receive_chunk) *
             element_size;
 
-        for (size_t block = 0; block < block_count; ++block) {
+        for (size_t block = 0; block < block_count; ++block)
+        {
             size_t block_offset = block * handle->pipeline_bytes;
             size_t outgoing =
                 block_offset < send_bytes
@@ -1078,7 +1133,8 @@ static int all_gather_phase(pg_handle_t *handle, void *buffer,
                          &next_buffer_addr, &next_buffer_rkey))
         return -1;
 
-    for (int step = 0; step < handle->size - 1; ++step) {
+    for (int step = 0; step < handle->size - 1; ++step)
+    {
         int send_chunk =
             (owned_chunk - step + handle->size) % handle->size;
         int receive_chunk =
@@ -1096,7 +1152,8 @@ static int all_gather_phase(pg_handle_t *handle, void *buffer,
             chunk_offset(total_count, handle->size, receive_chunk) *
             element_size;
 
-        for (size_t block = 0; block < block_count; ++block) {
+        for (size_t block = 0; block < block_count; ++block)
+        {
             size_t block_offset = block * handle->pipeline_bytes;
             size_t outgoing =
                 block_offset < send_bytes
@@ -1149,10 +1206,32 @@ static struct ibv_mr *register_collective_buffer(pg_handle_t *handle,
 
     if (!bytes)
         bytes = 1;
+
+    // We first search in the cache
+    for (int i = 0; i < handle->mr_cache_count; ++i)
+    {
+        if (handle->mr_cache[i].addr == buffer && handle->mr_cache[i].length >= bytes)
+        {
+            return handle->mr_cache[i].mr;
+        }
+    }
+
+    // if not found in the cache, we register the memory in the mc
     mr = ibv_reg_mr(handle->pd, buffer, bytes,
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!mr)
         report_errno("ibv_reg_mr(collective buffer)");
+
+    // Saving in the cache for future use
+    if (handle->mr_cache_count < MAX_MR_CACHE)
+    {
+        handle->mr_cache[handle->mr_cache_count].addr = buffer;
+        handle->mr_cache[handle->mr_cache_count].length = bytes;
+        handle->mr_cache[handle->mr_cache_count].mr = mr;
+        handle->mr_cache[handle->mr_cache_count].has_remote = false;
+        handle->mr_cache_count++;
+    }
+
     return mr;
 }
 
@@ -1184,22 +1263,15 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count,
     if (!recv_mr)
         goto out;
 
-    if (reduce_scatter_phase(handle, recvbuf, count, datatype, op,
-                             recv_mr, eager))
+    if (pipeline_ring_phase(handle, recvbuf, count, datatype, op, recv_mr, eager, true, 0))
         goto out;
 
     owned_chunk = handle->rank;
-    if (all_gather_phase(handle, recvbuf, count, datatype, recv_mr,
-                         eager, owned_chunk))
+    if (pipeline_ring_phase(handle, recvbuf, count, datatype, op, recv_mr, eager, false, owned_chunk))
         goto out;
-
     result = 0;
 
 out:
-    if (recv_mr && ibv_dereg_mr(recv_mr)) {
-        report_errno("ibv_dereg_mr");
-        result = -1;
-    }
     if (ring_barrier(handle))
         result = -1;
     return result;
@@ -1229,35 +1301,51 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int recv_count,
 
     if (ring_barrier(handle))
         return -1;
-    work = malloc(bytes ? bytes : 1);
-    if (!work) {
-        report_errno("allocating reduce-scatter work buffer");
+
+    if (handle->rs_work_bytes < (bytes ? bytes : 1))
+    {
+        if (handle->rs_work_mr)
+        {
+            ibv_dereg_mr(handle->rs_work_mr);
+            handle->rs_work_mr = NULL;
+        }
+        if (handle->rs_work_buf)
+        {
+            free(handle->rs_work_buf);
+        }
+    }
+
+    handle->rs_work_bytes = (bytes ? bytes : 1);
+    handle->rs_work_buf = malloc(handle->rs_work_bytes);
+    if (!handle->rs_work_buf)
+    {
+        handle->rs_work_bytes = 0;
+        report_errno("allocating persistent reduce-scatter work buffer");
         goto out;
     }
-    if (bytes)
-        memcpy(work, sendbuf, bytes);
 
-    work_mr = register_collective_buffer(handle, work, bytes);
-    if (!work_mr)
+    handle->rs_work_mr = ibv_reg_mr(handle->pd, handle->rs_work_buf, handle->rs_work_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!handle->rs_work_mr)
+    {
+        report_errno("ibv_reg_mr(rs_work_buf)");
         goto out;
-    if (reduce_scatter_phase(handle, work, (int)total_count, datatype, op,
-                             work_mr, eager))
+    }
+
+    if (bytes)
+        memcpy(handle->rs_work_buf, sendbuf, bytes);
+
+    if (pipeline_ring_phase(handle, handle->rs_work_buf, (int)total_count, datatype, op, handle->rs_work_mr, eager, true, 0))
         goto out;
 
     owned_chunk = handle->rank;
     if (recv_count)
         memcpy(recvbuf,
-               (uint8_t *)work +
+               (uint8_t *)handle->rs_work_buf +
                    (size_t)owned_chunk * (size_t)recv_count * element_size,
                (size_t)recv_count * element_size);
     result = 0;
 
 out:
-    if (work_mr && ibv_dereg_mr(work_mr)) {
-        report_errno("ibv_dereg_mr");
-        result = -1;
-    }
-    free(work);
     if (ring_barrier(handle))
         result = -1;
     return result;
@@ -1295,19 +1383,123 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int send_count,
     recv_mr = register_collective_buffer(handle, recvbuf, bytes);
     if (!recv_mr)
         goto out;
-    if (all_gather_phase(handle, recvbuf, (int)total_count, datatype,
-                         recv_mr, eager, handle->rank))
+    if (pipeline_ring_phase(handle, recvbuf, (int)total_count, datatype, OP_SUM, recv_mr, eager, false, handle->rank))
         goto out;
     result = 0;
 
 out:
-    if (recv_mr && ibv_dereg_mr(recv_mr)) {
-        report_errno("ibv_dereg_mr");
-        result = -1;
-    }
     if (ring_barrier(handle))
         result = -1;
     return result;
+}
+
+static int pipeline_ring_phase(pg_handle_t *handle, void *buffer, int total_count, DATATYPE datatype, OPERATION operation, const struct ibv_mr *buffer_mr, bool eager, bool is_reduce_phase, int owned_chunk)
+{
+    size_t element_size = datatype_size(datatype);
+    size_t maximum_chunk = chunk_count(total_count, handle->size, 0) * element_size;
+    size_t block_count = (maximum_chunk + handle->pipeline_bytes - 1) / handle->pipeline_bytes;
+
+    uint64_t next_buffer_addr = 0;
+    uint32_t next_buffer_rkey = 0;
+
+    if (!block_count)
+        block_count = 1;
+    if (block_count > UINT16_MAX)
+        return report_error("PG_PIPELINE_BYTES creates too many blocks");
+
+    if (!is_reduce_phase && !eager)
+    {
+        mr_cache_entry_t *cache_entry = NULL;
+
+        for (int i = 0; i < handle->mr_cache_count; ++i)
+        {
+            if (handle->mr_cache[i].addr == buffer)
+            {
+                cache_entry = &handle->mr_cache[i];
+                break;
+            }
+        }
+
+        if (cache_entry && cache_entry->has_remote)
+        {
+            next_buffer_addr = cache_entry->remote_addr;
+            next_buffer_rkey = cache_entry->remote_rkey;
+        }
+        else
+        {
+            if (exchange_next_mr(handle, buffer_mr, (uintptr_t)buffer, &next_buffer_addr, &next_buffer_rkey))
+                return -1;
+            if (cache_entry)
+            {
+                cache_entry->remote_addr = next_buffer_addr;
+                cache_entry->remote_rkey = next_buffer_rkey;
+                cache_entry->has_remote = true;
+            }
+        }
+    }
+
+    for (int step = 0; step < handle->size - 1; ++step)
+    {
+        int send_chunk, receive_chunk;
+        if (is_reduce_phase)
+        {
+            send_chunk = (handle->rank - step - 1 + handle->size) % handle->size;
+            receive_chunk = (handle->rank - step - 2 + 2 * handle->size) % handle->size;
+        }
+        else
+        {
+            send_chunk = (owned_chunk - step + handle->size) % handle->size;
+            receive_chunk = (owned_chunk - step - 1 + handle->size) % handle->size;
+        }
+
+        size_t send_bytes = chunk_count(total_count, handle->size, send_chunk) * element_size;
+        size_t receive_bytes = chunk_count(total_count, handle->size, receive_chunk) * element_size;
+        size_t send_base = chunk_offset(total_count, handle->size, send_chunk) * element_size;
+        size_t receive_base = chunk_offset(total_count, handle->size, receive_chunk) * element_size;
+
+        for (size_t block = 0; block < block_count; ++block)
+        {
+            size_t block_offset = block * handle->pipeline_bytes;
+            size_t outgoing = block_offset < send_bytes ? send_bytes - block_offset : 0;
+            size_t incoming = block_offset < receive_bytes ? receive_bytes - block_offset : 0;
+
+            unsigned phase_tag = is_reduce_phase ? PHASE_REDUCE_SCATTER : PHASE_ALL_GATHER;
+            uint32_t tag = make_tag(phase_tag, (unsigned)step, (unsigned)block);
+            bool send_completed = false;
+
+            size_t scratch_offset = (((size_t)step * block_count + block) & 1U) * handle->pipeline_bytes;
+
+            if (outgoing > handle->pipeline_bytes)
+                outgoing = handle->pipeline_bytes;
+            if (incoming > handle->pipeline_bytes)
+                incoming = handle->pipeline_bytes;
+
+            uint64_t remote_addr = is_reduce_phase ? (handle->next_rx.scratch_addr + scratch_offset) : (outgoing ? next_buffer_addr + send_base + block_offset : next_buffer_addr);
+            uint32_t remote_rkey = is_reduce_phase ? handle->next_rx.scratch_rkey : next_buffer_rkey;
+
+            void *recv_target = is_reduce_phase ? ((uint8_t *)handle->scratch + scratch_offset) : (incoming ? (uint8_t *)buffer + receive_base + block_offset : buffer);
+            struct ibv_mr *recv_mr = is_reduce_phase ? handle->scratch_mr : buffer_mr;
+
+            if (post_receive(handle, tag, recv_target, incoming, recv_mr, eager) ||
+                post_transfer(handle, tag,
+                              outgoing ? (uint8_t *)buffer + send_base + block_offset : buffer,
+                              outgoing, buffer_mr, eager, remote_addr, remote_rkey) ||
+                wait_for_receive(handle, tag, &send_completed))
+                return -1;
+
+            if (is_reduce_phase && incoming)
+            {
+                if (reduce_values((uint8_t *)buffer + receive_base + block_offset,
+                                  (uint8_t *)handle->scratch + scratch_offset,
+                                  incoming / element_size, datatype, operation))
+                    return -1;
+            }
+
+            if (!send_completed && wait_for_send(handle, tag))
+                return -1;
+        }
+    }
+    return 0;
 }
 
 int pg_close(void *pg_handle)
@@ -1324,6 +1516,10 @@ int pg_close(void *pg_handle)
         close(handle->next_sock);
     if (handle->prev_sock >= 0)
         close(handle->prev_sock);
+    if (handle->rs_work_mr && ibv_dereg_mr(handle->rs_work_mr))
+        result = report_errno("ibv_dereg_mr(rs_work)");
+    if (handle->rs_work_buf)
+        free(handle->rs_work_buf);
     if (handle->scratch_mr && ibv_dereg_mr(handle->scratch_mr))
         result = report_errno("ibv_dereg_mr(scratch)");
     free(handle->scratch);
@@ -1337,12 +1533,19 @@ int pg_close(void *pg_handle)
         result = report_errno("ibv_dealloc_pd");
     if (handle->context && ibv_close_device(handle->context))
         result = report_errno("ibv_close_device");
+
+    for (int i = 0; i < handle->mr_cache_count; i++)
+    {
+        if (ibv_dereg_mr(handle->mr_cache[i].mr))
+            result = report_errno("ibv_dereg_mr(cache)");
+    }
     free_hosts(handle);
     free(handle);
     return result;
 }
 
-typedef struct {
+typedef struct
+{
     int rank;
     const char *hosts;
     char *owned_hosts;
@@ -1389,7 +1592,8 @@ static int parse_host_list(int argc, char **argv, int *index,
     char *hosts;
     char *cursor;
 
-    while (end < argc && argv[end][0] != '-') {
+    while (end < argc && argv[end][0] != '-')
+    {
         length += strlen(argv[end]) + 1;
         ++end;
     }
@@ -1401,7 +1605,8 @@ static int parse_host_list(int argc, char **argv, int *index,
         return -1;
 
     cursor = hosts;
-    for (int i = first; i < end; ++i) {
+    for (int i = first; i < end; ++i)
+    {
         size_t host_length = strlen(argv[i]);
         memcpy(cursor, argv[i], host_length);
         cursor += host_length;
@@ -1423,31 +1628,44 @@ static int parse_options(int argc, char **argv, options_t *options)
         .iterations = 20,
         .datatype = DATATYPE_INT,
         .operation = OP_SUM,
-        .protocol = "auto"
-    };
+        .protocol = "auto"};
 
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--rank") && i + 1 < argc) {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!strcmp(argv[i], "--rank") && i + 1 < argc)
+        {
             if (parse_int(argv[++i], 0, &options->rank))
                 return -1;
-        } else if (!strcmp(argv[i], "-myindex") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "-myindex") && i + 1 < argc)
+        {
             if (parse_int(argv[++i], 1, &options->rank))
                 return -1;
             --options->rank;
-        } else if (!strcmp(argv[i], "--hosts") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--hosts") && i + 1 < argc)
+        {
             free(options->owned_hosts);
             options->owned_hosts = NULL;
             options->hosts = argv[++i];
-        } else if (!strcmp(argv[i], "-list")) {
+        }
+        else if (!strcmp(argv[i], "-list"))
+        {
             if (parse_host_list(argc, argv, &i, options))
                 return -1;
-        } else if (!strcmp(argv[i], "--count") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--count") && i + 1 < argc)
+        {
             if (parse_int(argv[++i], 0, &options->count))
                 return -1;
-        } else if (!strcmp(argv[i], "--iterations") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--iterations") && i + 1 < argc)
+        {
             if (parse_int(argv[++i], 1, &options->iterations))
                 return -1;
-        } else if (!strcmp(argv[i], "--datatype") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--datatype") && i + 1 < argc)
+        {
             const char *value = argv[++i];
             if (!strcmp(value, "int"))
                 options->datatype = DATATYPE_INT;
@@ -1457,7 +1675,9 @@ static int parse_options(int argc, char **argv, options_t *options)
                 options->datatype = DATATYPE_DOUBLE;
             else
                 return -1;
-        } else if (!strcmp(argv[i], "--op") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--op") && i + 1 < argc)
+        {
             const char *value = argv[++i];
             if (!strcmp(value, "sum"))
                 options->operation = OP_SUM;
@@ -1469,13 +1689,17 @@ static int parse_options(int argc, char **argv, options_t *options)
                 options->operation = OP_MIN;
             else
                 return -1;
-        } else if (!strcmp(argv[i], "--protocol") && i + 1 < argc) {
+        }
+        else if (!strcmp(argv[i], "--protocol") && i + 1 < argc)
+        {
             options->protocol = argv[++i];
             if (strcmp(options->protocol, "auto") &&
                 strcmp(options->protocol, "eager") &&
                 strcmp(options->protocol, "rendezvous"))
                 return -1;
-        } else {
+        }
+        else
+        {
             return -1;
         }
     }
@@ -1503,15 +1727,20 @@ static size_t benchmark_type_size(DATATYPE datatype)
 static void initialize_input(void *buffer, int count, DATATYPE datatype,
                              int rank)
 {
-    if (datatype == DATATYPE_INT) {
+    if (datatype == DATATYPE_INT)
+    {
         int *values = buffer;
         for (int i = 0; i < count; ++i)
             values[i] = rank + 1;
-    } else if (datatype == DATATYPE_FLOAT) {
+    }
+    else if (datatype == DATATYPE_FLOAT)
+    {
         float *values = buffer;
         for (int i = 0; i < count; ++i)
             values[i] = (float)(rank + 1);
-    } else {
+    }
+    else
+    {
         double *values = buffer;
         for (int i = 0; i < count; ++i)
             values[i] = (double)(rank + 1);
@@ -1538,7 +1767,8 @@ static double expected_value(int size, OPERATION operation)
 static int verify_result(const void *buffer, int count, DATATYPE datatype,
                          double expected)
 {
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < count; ++i)
+    {
         double actual;
         if (datatype == DATATYPE_INT)
             actual = ((const int *)buffer)[i];
@@ -1548,7 +1778,8 @@ static int verify_result(const void *buffer, int count, DATATYPE datatype,
             actual = ((const double *)buffer)[i];
 
         if (fabs(actual - expected) >
-            1e-5 * (fabs(expected) > 1.0 ? fabs(expected) : 1.0)) {
+            1e-5 * (fabs(expected) > 1.0 ? fabs(expected) : 1.0))
+        {
             fprintf(stderr,
                     "verification failed at element %d: got %.10g, expected %.10g\n",
                     i, actual, expected);
@@ -1577,14 +1808,16 @@ int main(int argc, char **argv)
     int size;
     int result = EXIT_FAILURE;
 
-    if (parse_options(argc, argv, &options)) {
+    if (parse_options(argc, argv, &options))
+    {
         usage(argv[0]);
         free(options.owned_hosts);
         return EXIT_FAILURE;
     }
 
     size = host_count(options.hosts);
-    if (options.rank >= size) {
+    if (options.rank >= size)
+    {
         fprintf(stderr, "rank %d is outside a %d-process host list\n",
                 options.rank, size);
         return EXIT_FAILURE;
@@ -1594,7 +1827,8 @@ int main(int argc, char **argv)
             benchmark_type_size(options.datatype);
     send_buffer = malloc(bytes ? bytes : 1);
     receive_buffer = malloc(bytes ? bytes : 1);
-    if (!send_buffer || !receive_buffer) {
+    if (!send_buffer || !receive_buffer)
+    {
         perror("malloc");
         goto out;
     }
@@ -1616,7 +1850,8 @@ int main(int argc, char **argv)
         goto out;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    for (int iteration = 0; iteration < options.iterations; ++iteration)
+    {
         initialize_input(send_buffer, options.count, options.datatype,
                          options.rank);
         if (pg_all_reduce(send_buffer, receive_buffer, options.count,
@@ -1629,7 +1864,8 @@ int main(int argc, char **argv)
                       expected_value(size, options.operation)))
         goto out;
 
-    if (options.rank == 0) {
+    if (options.rank == 0)
+    {
         double average_us =
             elapsed_seconds(&start, &end) * 1e6 / options.iterations;
         printf("ranks=%d count=%d bytes=%zu protocol=%s iterations=%d "
