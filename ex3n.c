@@ -46,6 +46,22 @@ enum OPERATION
     OP_MIN
 };
 
+//
+enum control_type {
+    RENDEZVOUS_REQUEST,
+    RENDEZVOUS_READY,
+    RENDEZVOUS_FIN
+};
+
+//
+struct control_message {
+    int type;
+    size_t size;
+
+    uint64_t addr;
+    uint32_t rkey;
+};
+
 /*
 Information about another process in the ring
 */
@@ -191,53 +207,106 @@ int connect_process_group(char *servername, void **pg_handle)
 }
 
 /* Eager */
-struct int send_eager(struct process_group *pg, void *buffer, size_t size)
+static int send_eager(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
 {
-    /*
-    TODO:
-    Small messages. Receiver already has a posted receive.
-    Build:
-        ibv_sge
-        ibv_send_wr
-    Then:
-        ibv_post_send()
-    Receiver:
-        ibv_post_recv()
-        ibv_poll_cq()
-    */
+    /* Describe the local buffer */
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+
+    sge.addr = (uintptr_t)buffer;
+    sge.length = size;
+    sge.lkey = mr->lkey;
+
+    /* Create SEND Work Request */
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = 1;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.next = NULL;
+
+    struct ibv_send_wr *bad_wr = NULL;
+
+    /* send to the next process in the ring */
+    if(ibv_post_send(pg->next_qp, &wr, &bad_wr)){
+        fprintf(stderr, "Failed to post Eager SEND\n");
+        return -1;
+    }
     return 0;
 }
 
 /* Rendezvous */
-static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, uint64_t remote_addr, uint32_t rkey)
+static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
 {
-    /*
-    TODO:
-    Large Messages. User RDMA Write or RDMA Read.
-    For RDMA Write:
-        WR opcode = IBV_WR_RDMA_WRITE
-    or:
-        IBV_WR_RDMA_WRITE_WITH_IMM
-    Destination:
-        wr.wr.rdma.remote_addr
-        wr.wr.rdma.rkey
-    */
+    /* handshake */
+    struct control_message *ctrl = (struct control_message *)pg->control_buffer;
+    /* Send Egaer control message */
+    ctrl->type = RENDEZVOUS_REQUEST;
+    ctrl->size = size;
+
+    if (send_eager(pg,
+                   ctrl,
+                   sizeof(struct control_message),
+                   pg->control_mr)) {
+        return -1;
+    }
+
+    /* wait for Ready message from the receiver */
+    if (wait_for_control_message(pg, RENDEZVOUS_READY)) {
+        return -1;
+    }
+
+    uint64_t remote_addr = ctrl->addr;
+    uint32_t remote_rkey = ctrl->rkey;
+
+    /* Describe the local buffer */
+    struct ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+
+    sge.addr = (uintptr_t)buffer;
+    sge.length = size;
+    sge.lkey = mr->lkey;
+
+    /* Create SEND Work Request */
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = 1;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode     = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    /* Remote memory information received during Rendezvous handshake */
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey        = remote_rkey;
+
+    struct ibv_send_wr *bad_wr = NULL;
+
+    /* RDMA Write to the next process in the ring */
+    if (ibv_post_send(pg->next_qp, &wr, &bad_wr)) {
+        fprintf(stderr, "Failed to post Rendezvous RDMA Write\n");
+        return -1;
+    }
     return 0;
 }
 
 /* Send Chunk- decide between Eager and Rendezvous */
-static int send_chunk(struct process_group *pg, void *buffer, size_t size, uint64_t remote_addr, uint32_t rkey)
-{
-    const size_t EAGER_THRESHOLD = 8192; // TODO: change in the end- after benchmark.
-    if (size <= EAGER_THRESHOLD)
-    {
-        return send_eager(pg, buffer, size);
-    }
-    else
-    {
-        return send_rendezvous(pg, buffer, size, remote_addr, rkey)
-    }
-}
+// static int send_chunk(struct process_group *pg, void *buffer, size_t size, uint64_t remote_addr, uint32_t rkey)
+// {
+//     const size_t EAGER_THRESHOLD = 8192; // TODO: change in the end- after benchmark.
+//     if (size <= EAGER_THRESHOLD)
+//     {
+//         return send_eager(pg, buffer, size);
+//     }
+//     else
+//     {
+//         return send_rendezvous(pg, buffer, size, remote_addr, rkey)
+//     }
+// }
 
 /* Reduce Scatter */
 static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op)
