@@ -32,14 +32,16 @@ enum OPERATION
 };
 
 //
-enum control_type {
+enum control_type
+{
     RENDEZVOUS_REQUEST,
     RENDEZVOUS_READY,
     RENDEZVOUS_FIN
 };
 
 //
-struct control_message {
+struct control_message
+{
     int type;
     size_t size;
 
@@ -93,7 +95,7 @@ struct process_group
     struct control_message *control_send_buffer;
     struct control_message *control_recv_buffer;
 
-    struct ibv_mr *control_send_mr;    // memory registrations
+    struct ibv_mr *control_send_mr; // memory registrations
     struct ibv_mr *control_recv_mr; // memory registrations
 
     // Info about near processes
@@ -135,7 +137,7 @@ static void reduce(void *dst, const void *src, int count, DATATYPE datatype, OPE
     */
 }
 
-/*RDMA Helper functions*/
+/* RDMA Helper functions */
 static int post_receive(struct process_group *pg,
                         struct ibv_qp *qp,
                         void *buffer,
@@ -165,7 +167,8 @@ static int post_receive(struct process_group *pg,
 static int wait_for_completion(struct process_group *pg,
                                struct ibv_wc *wc)
 {
-    while (1) {
+    while (1)
+    {
         int n = ibv_poll_cq(pg->cq, 1, wc);
 
         if (n < 0)
@@ -189,13 +192,15 @@ static int init_rdma_resources(struct process_group *pg)
 
     /* Find RDMA device */
     dev_list = ibv_get_device_list(NULL);
-    if (!dev_list) {
+    if (!dev_list)
+    {
         fprintf(stderr, "Failed to get RDMA device list\n");
         return -1;
     }
 
     ib_dev = dev_list[0];
-    if (!ib_dev) {
+    if (!ib_dev)
+    {
         fprintf(stderr, "No RDMA device found\n");
         ibv_free_device_list(dev_list);
         return -1;
@@ -203,7 +208,8 @@ static int init_rdma_resources(struct process_group *pg)
 
     /* Open RDMA device */
     pg->context = ibv_open_device(ib_dev);
-    if (!pg->context) {
+    if (!pg->context)
+    {
         fprintf(stderr, "Failed to open RDMA device\n");
         ibv_free_device_list(dev_list);
         return -1;
@@ -213,14 +219,16 @@ static int init_rdma_resources(struct process_group *pg)
 
     /* Allocate Protection Domain */
     pg->pd = ibv_alloc_pd(pg->context);
-    if (!pg->pd) {
+    if (!pg->pd)
+    {
         fprintf(stderr, "Failed to allocate PD\n");
         return -1;
     }
 
     /* Create Completion Queue */
     pg->cq = ibv_create_cq(pg->context, 128, NULL, NULL, 0);
-    if (!pg->cq) {
+    if (!pg->cq)
+    {
         fprintf(stderr, "Failed to create CQ\n");
         return -1;
     }
@@ -232,7 +240,8 @@ static int init_rdma_resources(struct process_group *pg)
     pg->control_recv_buffer =
         (struct control_message *)calloc(1, sizeof(struct control_message));
 
-    if (!pg->control_send_buffer || !pg->control_recv_buffer) {
+    if (!pg->control_send_buffer || !pg->control_recv_buffer)
+    {
         fprintf(stderr, "Failed to allocate control buffers\n");
         return -1;
     }
@@ -250,7 +259,8 @@ static int init_rdma_resources(struct process_group *pg)
                    sizeof(struct control_message),
                    IBV_ACCESS_LOCAL_WRITE);
 
-    if (!pg->control_send_mr || !pg->control_recv_mr) {
+    if (!pg->control_send_mr || !pg->control_recv_mr)
+    {
         fprintf(stderr, "Failed to register control buffers\n");
         return -1;
     }
@@ -262,8 +272,8 @@ static int init_rdma_resources(struct process_group *pg)
     qp_attr.send_cq = pg->cq;
     qp_attr.recv_cq = pg->cq;
 
-    qp_attr.cap.max_send_wr  = TX_DEPTH;
-    qp_attr.cap.max_recv_wr  = RX_DEPTH;
+    qp_attr.cap.max_send_wr = TX_DEPTH;
+    qp_attr.cap.max_recv_wr = RX_DEPTH;
     qp_attr.cap.max_send_sge = 1;
     qp_attr.cap.max_recv_sge = 1;
 
@@ -271,14 +281,16 @@ static int init_rdma_resources(struct process_group *pg)
 
     /* QP towards the next process */
     pg->next_qp = ibv_create_qp(pg->pd, &qp_attr);
-    if (!pg->next_qp) {
+    if (!pg->next_qp)
+    {
         fprintf(stderr, "Failed to create next QP\n");
         return -1;
     }
 
     /* QP towards the previous process */
     pg->prev_qp = ibv_create_qp(pg->pd, &qp_attr);
-    if (!pg->prev_qp) {
+    if (!pg->prev_qp)
+    {
         fprintf(stderr, "Failed to create previous QP\n");
         return -1;
     }
@@ -304,9 +316,10 @@ static int connect_one_qp(struct ibv_qp *qp,
 
     if (ibv_modify_qp(qp, &attr,
                       IBV_QP_STATE |
-                      IBV_QP_PKEY_INDEX |
-                      IBV_QP_PORT |
-                      IBV_QP_ACCESS_FLAGS)) {
+                          IBV_QP_PKEY_INDEX |
+                          IBV_QP_PORT |
+                          IBV_QP_ACCESS_FLAGS))
+    {
         fprintf(stderr, "Failed to modify QP to INIT\n");
         return -1;
     }
@@ -314,8 +327,8 @@ static int connect_one_qp(struct ibv_qp *qp,
     /* INIT -> RTR */
     memset(&attr, 0, sizeof(attr));
 
-    attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = IBV_MTU_1024;
+    attr.qp_state = IBV_QPS_RTR;  // Ready to receive
+    attr.path_mtu = IBV_MTU_1024; // max pack size of 1024
     attr.dest_qp_num = remote->qpn;
     attr.rq_psn = remote->psn;
     attr.max_dest_rd_atomic = 1;
@@ -329,12 +342,13 @@ static int connect_one_qp(struct ibv_qp *qp,
 
     if (ibv_modify_qp(qp, &attr,
                       IBV_QP_STATE |
-                      IBV_QP_AV |
-                      IBV_QP_PATH_MTU |
-                      IBV_QP_DEST_QPN |
-                      IBV_QP_RQ_PSN |
-                      IBV_QP_MAX_DEST_RD_ATOMIC |
-                      IBV_QP_MIN_RNR_TIMER)) {
+                          IBV_QP_AV |
+                          IBV_QP_PATH_MTU |
+                          IBV_QP_DEST_QPN |
+                          IBV_QP_RQ_PSN |
+                          IBV_QP_MAX_DEST_RD_ATOMIC |
+                          IBV_QP_MIN_RNR_TIMER))
+    {
         fprintf(stderr, "Failed to modify QP to RTR\n");
         return -1;
     }
@@ -351,18 +365,18 @@ static int connect_one_qp(struct ibv_qp *qp,
 
     if (ibv_modify_qp(qp, &attr,
                       IBV_QP_STATE |
-                      IBV_QP_TIMEOUT |
-                      IBV_QP_RETRY_CNT |
-                      IBV_QP_RNR_RETRY |
-                      IBV_QP_SQ_PSN |
-                      IBV_QP_MAX_QP_RD_ATOMIC)) {
+                          IBV_QP_TIMEOUT |
+                          IBV_QP_RETRY_CNT |
+                          IBV_QP_RNR_RETRY |
+                          IBV_QP_SQ_PSN |
+                          IBV_QP_MAX_QP_RD_ATOMIC))
+    {
         fprintf(stderr, "Failed to modify QP to RTS\n");
         return -1;
     }
 
     return 0;
 }
-
 
 /*
  * Send exactly len bytes over a TCP socket.
@@ -371,7 +385,8 @@ static int tcp_send_all(int sockfd, const void *buffer, size_t len)
 {
     const char *ptr = (const char *)buffer;
 
-    while (len > 0) {
+    while (len > 0)
+    {
         ssize_t n = send(sockfd, ptr, len, 0);
 
         if (n <= 0)
@@ -384,7 +399,6 @@ static int tcp_send_all(int sockfd, const void *buffer, size_t len)
     return 0;
 }
 
-
 /*
  * Receive exactly len bytes from a TCP socket.
  */
@@ -392,7 +406,8 @@ static int tcp_recv_all(int sockfd, void *buffer, size_t len)
 {
     char *ptr = (char *)buffer;
 
-    while (len > 0) {
+    while (len > 0)
+    {
         ssize_t n = recv(sockfd, ptr, len, 0);
 
         if (n <= 0)
@@ -417,20 +432,19 @@ static int connect_qps(struct process_group *pg,
     /*
      * Get the LID of our local RDMA port.
      */
-    if (ibv_query_port(pg->context, 1, &port_attr)) {
+    if (ibv_query_port(pg->context, 1, &port_attr))
+    {
         fprintf(stderr, "Failed to query RDMA port\n");
         return -1;
     }
 
     uint16_t local_lid = port_attr.lid;
 
-
     /*
      * Each local QP gets its own starting PSN.
      */
     uint32_t next_psn = lrand48() & 0xffffff;
     uint32_t prev_psn = lrand48() & 0xffffff;
-
 
     /*
      * Describe our two local QPs.
@@ -449,7 +463,6 @@ static int connect_qps(struct process_group *pg,
     local_prev.qpn = pg->prev_qp->qp_num;
     local_prev.psn = prev_psn;
 
-
     /*
      * Each process listens for its PREVIOUS neighbor
      * and connects as a client to its NEXT neighbor.
@@ -458,9 +471,8 @@ static int connect_qps(struct process_group *pg,
      */
     const int BASE_PORT = 18515;
 
-    int my_port   = BASE_PORT + pg->pid;
+    int my_port = BASE_PORT + pg->pid;
     int next_port = BASE_PORT + pg->next_pid;
-
 
     /*
      * Avoid deadlock:
@@ -468,14 +480,16 @@ static int connect_qps(struct process_group *pg,
      * even ranks first listen and then connect,
      * odd ranks first connect and then listen.
      */
-    if ((pg->pid % 2) == 0) {
+    if ((pg->pid % 2) == 0)
+    {
 
         /*
          * Previous process connects to our prev_qp.
          */
         if (tcp_server_exchange(my_port,
                                 &local_prev,
-                                &pg->prev)) {
+                                &pg->prev))
+        {
 
             fprintf(stderr,
                     "Failed to exchange information with previous process\n");
@@ -489,15 +503,17 @@ static int connect_qps(struct process_group *pg,
         if (tcp_client_exchange(servername,
                                 next_port,
                                 &local_next,
-                                &pg->next)) {
+                                &pg->next))
+        {
 
             fprintf(stderr,
                     "Failed to exchange information with next process\n");
 
             return -1;
         }
-
-    } else {
+    }
+    else
+    {
 
         /*
          * Connect our next_qp to the next process.
@@ -505,7 +521,8 @@ static int connect_qps(struct process_group *pg,
         if (tcp_client_exchange(servername,
                                 next_port,
                                 &local_next,
-                                &pg->next)) {
+                                &pg->next))
+        {
 
             fprintf(stderr,
                     "Failed to exchange information with next process\n");
@@ -518,7 +535,8 @@ static int connect_qps(struct process_group *pg,
          */
         if (tcp_server_exchange(my_port,
                                 &local_prev,
-                                &pg->prev)) {
+                                &pg->prev))
+        {
 
             fprintf(stderr,
                     "Failed to exchange information with previous process\n");
@@ -526,7 +544,6 @@ static int connect_qps(struct process_group *pg,
             return -1;
         }
     }
-
 
     /*
      * We now know the remote LID/QPN/PSN.
@@ -539,7 +556,8 @@ static int connect_qps(struct process_group *pg,
      */
     if (connect_one_qp(pg->next_qp,
                        &pg->next,
-                       next_psn)) {
+                       next_psn))
+    {
 
         fprintf(stderr, "Failed to connect next QP\n");
         return -1;
@@ -547,7 +565,8 @@ static int connect_qps(struct process_group *pg,
 
     if (connect_one_qp(pg->prev_qp,
                        &pg->prev,
-                       prev_psn)) {
+                       prev_psn))
+    {
 
         fprintf(stderr, "Failed to connect previous QP\n");
         return -1;
@@ -615,14 +634,15 @@ static int send_eager(struct process_group *pg, void *buffer, size_t size, struc
     struct ibv_send_wr *bad_wr = NULL;
 
     /* send to the next process in the ring */
-    if(ibv_post_send(pg->next_qp, &wr, &bad_wr)){
+    if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
+    {
         fprintf(stderr, "Failed to post Eager SEND\n");
         return -1;
     }
     return 0;
 }
 
-/*Rendezvous helper function 
+/*Rendezvous helper function
     - Wait for a spesific Randezuos control message*/
 static int wait_for_control_message(struct process_group *pg,
                                     control_type expected_type)
@@ -633,19 +653,22 @@ static int wait_for_control_message(struct process_group *pg,
                      pg->control_recv_buffer,
                      sizeof(struct control_message),
                      pg->control_recv_mr,
-                     2)) {
+                     2))
+    {
         return -1;
     }
 
     /* Wait until the message arrives */
     struct ibv_wc wc;
 
-    if (wait_for_completion(pg, &wc)) {
+    if (wait_for_completion(pg, &wc))
+    {
         return -1;
     }
 
     /* Verify that we received the expected control message */
-    if (pg->control_recv_buffer->type != expected_type) {
+    if (pg->control_recv_buffer->type != expected_type)
+    {
         fprintf(stderr, "Unexpected Rendezvous control message\n");
         return -1;
     }
@@ -665,12 +688,14 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     if (send_eager(pg,
                    ctrl,
                    sizeof(struct control_message),
-                   pg->control_send_mr)) {
+                   pg->control_send_mr))
+    {
         return -1;
     }
 
     /* wait for Ready message from the receiver */
-    if (wait_for_control_message(pg, RENDEZVOUS_READY)) {
+    if (wait_for_control_message(pg, RENDEZVOUS_READY))
+    {
         return -1;
     }
 
@@ -692,17 +717,18 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     wr.wr_id = 1;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.opcode     = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
 
     /* Remote memory information received during Rendezvous handshake */
     wr.wr.rdma.remote_addr = remote_addr;
-    wr.wr.rdma.rkey        = remote_rkey;
+    wr.wr.rdma.rkey = remote_rkey;
 
     struct ibv_send_wr *bad_wr = NULL;
 
     /* RDMA Write to the next process in the ring */
-    if (ibv_post_send(pg->next_qp, &wr, &bad_wr)) {
+    if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
+    {
         fprintf(stderr, "Failed to post Rendezvous RDMA Write\n");
         return -1;
     }
@@ -853,18 +879,42 @@ int pg_close(void *pg_handle)
     if (!pg)
         return 0;
 
-    /*
-    TODO:
-        ibv_destroy_qp()
-        ibv_destroy_cq()
-        ibv_dereg_mr()
-        ibv_dealloc_mr()
-        ibv_dealloc_pd()
-        ibv_close_device()
+    /* Destroy QPs */
+    if (pg->next_qp)
+        ibv_destroy_qp(pg->next_qp);
+    if (pg->prev_qp)
+        ibv_destroy_qp(pg->prev_qp);
 
-        free buffers
-    */
+    /* De-Register memory regions */
+    if (pg->control_send_mr)
+        ibv_dereg_mr(pg->send_mr);
+    if (pg->control_recv_mr)
+        ibv_dereg_mr(pg->recv_mr);
+
+    if (pg->recv_mr)
+        ibv_dereg_mr(pg->recv_mr);
+    if (pg->staging_mr)
+        ibv_dereg_mr(pg->staging_mr);
+
+    /* Free memory buffers */
+    if (pg->control_send_buffer)
+        free(pg->control_send_buffer);
+    if (pg->control_recv_buffer)
+        free(pg->control_recv_buffer);
+
+    /* Destroy completion queue */
+    if (pg->cq)
+        ibv_destroy_cq(pg->cq);
+
+    /* Deallocate Protection Domain */
+    if (pg->pd)
+        ibv_dealloc_pd(pg->pd);
+
+    /* Close Device Context */
+    if (pg->context)
+        ibv_close_device(pg->context);
 
     free(pg);
+
     return 0;
 }
