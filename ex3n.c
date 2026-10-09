@@ -24,17 +24,15 @@
 // Indication for send_buf type
 enum DATATYPE
 {
-    TYPE_INT,
-    TYPE_FLOAT,
-    TYPE_DOUBLE
+    TYPE_INT32,
+    TYPE_FP64
 };
 
 // which reduction action to preform
 enum OPERATION
 {
     OP_SUM,
-    OP_MAX,
-    OP_MIN
+    OP_PRODUCT
 };
 
 //
@@ -128,33 +126,43 @@ static size_t datatype_size(DATATYPE datatype)
 { // Returns the datatype size
     switch (datatype)
     {
-    case TYPE_INT:
-        return sizeof(int);
-    case TYPE_FLOAT:
-        return sizeof(float);
-    case TYPE_DOUBLE:
+    case TYPE_INT32:
+        return sizeof(int32_t);
+    case TYPE_FP64:
         return sizeof(double);
     default:
         return 0;
     }
 }
 
+template<typename T> static void reduce_typed(T *dst, const T *src, int count, OPERATION op)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        switch (op)
+        {
+        case OP_SUM:
+            dst[i] += src[i];
+            break;
+        case OP_PRODUCT:
+            dst[i] *= src[i];
+            break;
+        }
+    }
+}
+
 // Reduction
 static void reduce(void *dst, const void *src, int count, DATATYPE datatype, OPERATION op)
 {
-    /*
-    TODO:
-    Implement SUM/MAX/MIN
-
-    Example:
-    if (datatype == TYPE_INT && op == OP_SUM) {
-        int *d = (int *)dst;
-        const int *s = (const int *)src;
-
-        for (int i = 0; i < count; ++i)
-            d[i] += s[i];
+    switch (datatype)
+    {
+    case TYPE_INT32:
+        reduce_typed((int32_t *)dst, (const int32_t *)src, count, op);
+        break;
+    case TYPE_FP64:
+        reduce_typed((double *)dst, (const double *)src, count, op);
+        break;
     }
-    */
 }
 
 /* RDMA Helper functions */
@@ -344,6 +352,72 @@ static int init_rdma_resources(struct process_group *pg)
     return 0;
 }
 
+static int prepare_data_buffers(struct process_group *pg, void *recv_buf, size_t total_bytes)
+{
+    if (total_bytes == 0)
+        return 0;
+
+    // Register the user-provided receive buffer
+    pg->recv_mr = ibv_reg_mr(pg->pd, recv_buf, total_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!pg->recv_mr)
+    {
+        fprintf(stderr, "Failed to register receive buffer\n");
+        return -1;
+    }
+    pg->recv_buffer = recv_buf;
+
+    // Temporary buffer for incoming Reduce Scatter data
+    size_t staging_size = 64 * 1024;
+
+    pg->staging_buffer = malloc(staging_size);
+
+    if (!pg->staging_buffer)
+    {
+        fprintf(stderr, "Failed to allocate staging buffer\n");
+        ibv_dereg_mr(pg->recv_mr);
+        pg->recv_mr = NULL;
+        pg->recv_buffer = NULL;
+        return -1;
+    }
+
+    pg->staging_mr = ibv_reg_mr(pg->pd, pg->staging_buffer, staging_size, IBV_ACCESS_LOCAL_WRITE);
+    if (!pg->staging_mr)
+    {
+        fprintf(stderr, "Failed to register staging buffer\n");
+
+        free(pg->staging_buffer);
+        pg->staging_buffer = NULL;
+
+        ibv_dereg_mr(pg->recv_mr);
+        pg->recv_mr = NULL;
+        pg->recv_buffer = NULL;
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static void release_data_buffers(struct process_group *pg)
+{
+    if (pg->recv_mr)
+    {
+        ibv_dereg_mr(pg->recv_mr);
+        pg->recv_mr = NULL;
+    }
+
+    if (pg->staging_mr)
+    {
+        ibv_dereg_mr(pg->staging_mr);
+        pg->staging_mr = NULL;
+    }
+
+    free(pg->staging_buffer);
+    pg->staging_buffer = NULL;
+
+    pg->recv_buffer = NULL;
+}
+
 /* Move a QP through INIT -> RTR -> RTS */
 static int connect_one_qp(struct ibv_qp *qp,
                           const struct rdma_peer *remote,
@@ -508,7 +582,7 @@ static int tcp_create_listener(int port)
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    if (bind(listen_fd, (struct sockaddr *)&adddr, sizeof(addr)) < 0)
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("bind");
         close(listen_fd);
@@ -533,7 +607,7 @@ static int tcp_client_exchange(const char *servername, int port, const struct rd
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    chat port_str[16];
+    char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
     if (getaddrinfo(servername, port_str, &hints, &res) != 0)
@@ -641,20 +715,40 @@ static int connect_qps(struct process_group *pg,
         return -1;
     }
 
-    if (tcp_client_exchange(servername, PORT, &local_next, &pg->next))
+    int rc = 0;
+
+    if (pg->pid % 2 == 0)
     {
-        fprintf(stderr, "Failed to exchange information with NEXT\n");
-        close(listen_fd);
-        return -1;
+        if (tcp_accept_exchange(listen_fd, &local_prev, &pg->prev))
+        {
+            fprintf(stderr, "Failed to exchange information with PREV\n");
+            rc = -1;
+        }
+        if (rc == 0 && tcp_client_exchange(servername, PORT, &local_next, &pg->next))
+        {
+            fprintf(stderr, "Failed to exchange information with NEXT\n");
+            rc = -1;
+        }
+    }
+    else
+    {
+        if (tcp_client_exchange(servername, PORT, &local_next, &pg->next))
+        {
+            fprintf(stderr, "Failed to exchange information with NEXT\n");
+            rc = -1;
+        }
+
+        if (rc == 0 && tcp_accept_exchange(listen_fd, &local_prev, &pg->prev))
+        {
+            fprintf(stderr, "Failed to exchange information with PREV\n");
+            rc = -1;
+        }
     }
 
-    if (tcp_accept_exchange(listen_fd, &local_prev, &pg->prev))
-    {
-        fprintf(stderr, "Failed to exchange information with PREV\n");
-        close(listen_fd);
-        return -1;
-    }
     close(listen_fd);
+
+    if (rc != 0)
+        return -1;
 
     /*
      * We now know the remote LID/QPN/PSN.
@@ -1159,24 +1253,51 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
 {
     struct process_group *pg = (struct process_group *)pg_handle;
 
-    if (!pg || !send_buf || !recv_buf)
+    if (!pg || count < 0)
         return -1;
 
-    size_t bytes = count * datatype_size(datatype);
+    size_t element_size = datatype_size(datatype);
 
-    /* initially: recvbuf = out own contribution */
-    memcpy(recv_buf, send_buf, bytes);
+    if (element_size == 0 || (op != OP_SUM && op != OP_PRODUCT))
+        return -1;
+
+    if (count == 0)
+        return 0;
+
+    if (!send_buf || !recv_buf)
+        return -1;
+
+    if ((size_t)count > SIZE_MAX / element_size)
+        return -1;
+
+    size_t bytes = (size_t)count * element_size;
+
+    if (count % pg->num_processes != 0)
+        return -1;
+
+    if (send_buf != recv_buf)
+        memcpy(recv_buf, send_buf, bytes);
+
+    release_data_buffers(pg);
+
+    if (prepare_data_buffers(pg, recv_buf, bytes) != 0)
+        return -1;
+
+    int rc = 0;
 
     /* Phase 1: Reduce Scatter */
-    if (reduce_scatter(pg, recv_buf, count, datatype, op))
+    if (reduce_scatter(pg, recv_buf, count, datatype, op) != 0)
     {
-        return -1;
+        rc = -1;
     }
 
     /* Phase 2: All Gather */
-    if (all_gather(pg, recv_buf, count, datatype))
+    if (rc == 0 && all_gather(pg, recv_buf, count, datatype) != 0)
     {
-        return -1;
+        rc = -1;
     }
-    return 0;
+
+    release_data_buffers(pg);
+
+    return rc;
 }
