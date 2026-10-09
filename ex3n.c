@@ -656,6 +656,54 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     return 0;
 }
 
+/* Cleanup */
+int pg_close(void *pg_handle)
+{
+    struct process_group *pg = (struct process_group *)pg_handle;
+
+    if (!pg)
+        return 0;
+
+    /* Destroy QPs */
+    if (pg->next_qp)
+        ibv_destroy_qp(pg->next_qp);
+    if (pg->prev_qp)
+        ibv_destroy_qp(pg->prev_qp);
+
+    /* De-Register memory regions */
+    if (pg->control_send_mr)
+        ibv_dereg_mr(pg->control_send_mr);
+    if (pg->control_recv_mr)
+        ibv_dereg_mr(pg->control_recv_mr);
+
+    if (pg->recv_mr)
+        ibv_dereg_mr(pg->recv_mr);
+    if (pg->staging_mr)
+        ibv_dereg_mr(pg->staging_mr);
+
+    /* Free memory buffers */
+    if (pg->control_send_buffer)
+        free(pg->control_send_buffer);
+    if (pg->control_recv_buffer)
+        free(pg->control_recv_buffer);
+
+    /* Destroy completion queue */
+    if (pg->cq)
+        ibv_destroy_cq(pg->cq);
+
+    /* Deallocate Protection Domain */
+    if (pg->pd)
+        ibv_dealloc_pd(pg->pd);
+
+    /* Close Device Context */
+    if (pg->context)
+        ibv_close_device(pg->context);
+
+    free(pg);
+
+    return 0;
+}
+
 /* API- connect all processes into a ring */
 int connect_process_group(char *servername, void **pg_handle)
 {
@@ -749,7 +797,7 @@ static int receive_eager(struct process_group *pg,
     }
 
     struct ibv_wc wc;
-    if (wait_for_completion(pg, WR_EAGER, RECV, &wc))
+    if (wait_for_completion(pg, WR_EAGER_RECV, &wc))
     {
         fprintf(stderr, "Failed waiting for Eager receive\n");
         return -1;
@@ -794,7 +842,8 @@ static int wait_for_control_message(struct process_group *pg,
 
     if (wc.opcode != IBV_WC_RECV || wc.byte_len != sizeof(struct control_message))
     {
-        fprintf(stderr, "Invaild control receive completion") return -1;
+        fprintf(stderr, "Invaild control receive completion\n");
+        return -1;
     }
 
     /* Verify that we received the expected control message */
@@ -1065,53 +1114,5 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
     {
         return -1;
     }
-    return 0;
-}
-
-/* Cleanup */
-int pg_close(void *pg_handle)
-{
-    struct process_group *pg = (struct process_group *)pg_handle;
-
-    if (!pg)
-        return 0;
-
-    /* Destroy QPs */
-    if (pg->next_qp)
-        ibv_destroy_qp(pg->next_qp);
-    if (pg->prev_qp)
-        ibv_destroy_qp(pg->prev_qp);
-
-    /* De-Register memory regions */
-    if (pg->control_send_mr)
-        ibv_dereg_mr(pg->send_mr);
-    if (pg->control_recv_mr)
-        ibv_dereg_mr(pg->recv_mr);
-
-    if (pg->recv_mr)
-        ibv_dereg_mr(pg->recv_mr);
-    if (pg->staging_mr)
-        ibv_dereg_mr(pg->staging_mr);
-
-    /* Free memory buffers */
-    if (pg->control_send_buffer)
-        free(pg->control_send_buffer);
-    if (pg->control_recv_buffer)
-        free(pg->control_recv_buffer);
-
-    /* Destroy completion queue */
-    if (pg->cq)
-        ibv_destroy_cq(pg->cq);
-
-    /* Deallocate Protection Domain */
-    if (pg->pd)
-        ibv_dealloc_pd(pg->pd);
-
-    /* Close Device Context */
-    if (pg->context)
-        ibv_close_device(pg->context);
-
-    free(pg);
-
     return 0;
 }
