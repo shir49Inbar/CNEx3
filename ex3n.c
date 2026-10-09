@@ -466,7 +466,7 @@ static int tcp_recv_all(int sockfd, void *buffer, size_t len)
     return 0;
 }
 
-static int tcp_accept_exchange(int listen_fd, const struct rdma_peer *local, struct rdma_peer, *remote)
+static int tcp_accept_exchange(int listen_fd, const struct rdma_peer *local, struct rdma_peer *remote)
 {
     int conn_fd = accept(listen_fd, NULL, NULL);
     if (conn_fd < 0)
@@ -485,6 +485,103 @@ static int tcp_accept_exchange(int listen_fd, const struct rdma_peer *local, str
     close(conn_fd);
     return 0;
 }
+
+static int tcp_create_listener(int port)
+{
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt");
+        close(listen_fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(listen_fd, (struct sockaddr *)&adddr, sizeof(addr)) < 0)
+    {
+        perror("bind");
+        close(listen_fd);
+        return -1;
+    }
+
+    if (listen(listen_fd, 1) < 0)
+    {
+        perror("listen");
+        close(listen_fd);
+        return -1;
+    }
+
+    return listen_fd;
+}
+
+static int tcp_client_exchange(const char *servername, int port, const struct rdma_peer *local, struct rdma_peer *remote)
+{
+    struct addrinfo hints = {};
+    struct addrinfo *res = NULL;
+
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    chat port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    if (getaddrinfo(servername, port_str, &hints, &res) != 0)
+    {
+        fprintf(stderr, "Failed to resolve server %s\n", servername);
+        return -1;
+    }
+
+    int sockfd = -1;
+
+    for (int attempt = 0; attempt < 100; ++attempt)
+    {
+        sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+        if (sockfd < 0)
+        {
+            freeaddrinfo(res);
+            return -1;
+        }
+
+        if (connect(sockfd, res->ai_addr, res->ai_addrlen) == 0)
+        {
+            break;
+        }
+
+        close(sockfd);
+        sockfd = -1;
+        usleep(100000);
+    }
+
+    freeaddrinfo(res);
+
+    if (sockfd < 0)
+    {
+        fprintf(stderr, "Failed to connect to %s\n", servername);
+        return -1;
+    }
+
+    if (tcp_send_all(sockfd, local, sizeof(*local)) || tcp_recv_all(sockfd, remote, sizeof(*remote)))
+    {
+        close(sockfd);
+        return -1;
+    }
+
+    close(sockfd);
+    return 0;
+}
+
 /*
  * Exchange RDMA information with our ring neighbors
  * and connect the two RC QPs.
@@ -551,7 +648,7 @@ static int connect_qps(struct process_group *pg,
         return -1;
     }
 
-    if (tcp_accept_exchange(listen_fd, &local_prev, &pg_prev))
+    if (tcp_accept_exchange(listen_fd, &local_prev, &pg->prev))
     {
         fprintf(stderr, "Failed to exchange information with PREV\n");
         close(listen_fd);
