@@ -9,9 +9,16 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <cerrno>
+#include <climit>
+#include <string>
+#include <vector>
+#include <sstream>
 
 #define TX_DEPTH 128
 #define RX_DEPTH 128
+
+#define MAX_PENDING_COMPLETIONS 128
 
 // Types Required by the API
 
@@ -38,6 +45,17 @@ enum control_type
     RENDEZVOUS_READY,
     RENDEZVOUS_FIN
 };
+
+typedef enum
+{
+    WR_EAGER_SEND = 1,
+    WR_EAGER_RECV,
+    WR_CONTROL_SEND,
+    WR_CONTROL_RECV_NEXT,
+    WR_CONTROL_RECV_PREV,
+    WR_RDMA_WRITE,
+    WR_RDMA_WRITE_RECV
+} wr_type;
 
 //
 struct control_message
@@ -101,6 +119,9 @@ struct process_group
     // Info about near processes
     struct rdma_peer next;
     struct rdma_peer prev;
+
+    struct ibv_wc pending_wc[MAX_PENDING_COMPLETIONS];
+    int pending_count;
 };
 
 /* Helper Functions */
@@ -165,11 +186,25 @@ static int post_receive(struct process_group *pg,
 }
 
 static int wait_for_completion(struct process_group *pg,
-                               struct ibv_wc *wc)
+                               uint64_t expected_wr_id,
+                               struct ibv_wc *result)
 {
+    for (int i = 0; i < pg->pending_count; i++)
+    {
+        if (pg->pending_wc[i].wr_id == expected_wr_id)
+        {
+            *result = pg->pending_wc[i];
+
+            pg->pending_wc[i] = pg->pending_wc[--pg->pending_count];
+
+            return result->status == IBV_WC_SUCCESS ? 0 : -1;
+        }
+    }
+
     while (1)
     {
-        int n = ibv_poll_cq(pg->cq, 1, wc);
+        struct ibv_wc wc;
+        int n = ibv_poll_cq(pg->cq, 1, &wc);
 
         if (n < 0)
             return -1;
@@ -177,10 +212,22 @@ static int wait_for_completion(struct process_group *pg,
         if (n == 0)
             continue;
 
-        if (wc->status != IBV_WC_SUCCESS)
+        if (wc.status != IBV_WC_SUCCESS)
             return -1;
 
-        return 0;
+        if (wc.wr_id == expected_wr_id)
+        {
+            *result = wc;
+            return 0;
+        }
+
+        if (pg->pending_count >= MAX_PENDING_COMPLETIONS)
+        {
+            fprintf(stderr, "Too many pending completions\n");
+            return -1;
+        }
+
+        pg->pending_wc[pg->pending_count++] = wc;
     }
 }
 
@@ -575,33 +622,81 @@ static int connect_qps(struct process_group *pg,
     return 0;
 }
 
+static int parse_server_config(const char *config, int *rank, std::vector<std::string> *servers)
+{
+    if (!config || !rank || !servers)
+        return -1;
+
+    std::istringstream input(config);
+    std::string rank_str;
+    std::string flag;
+
+    if (!(input >> rank_str >> flag))
+        return -1;
+
+    if (flag != "-list")
+        return -1;
+
+    char *end = nullptr;
+    long parsed_rank = strtol(rank_str.c_str(), &end, 10);
+
+    if (*end != '\0' || parsed_rank < 0)
+        return -1;
+
+    servers->clear();
+
+    std::string host;
+    while (input >> host)
+        servers->push_back(host);
+
+    if (servers->size() < 2 || parsed_rank >= (long)servers->size())
+        return -1;
+
+    *rank = (int)parsed_rank;
+    return 0;
+}
+
 /* API- connect all processes into a ring */
 int connect_process_group(char *servername, void **pg_handle)
 {
-    struct process_group *pg = (struct process_group *)calloc(1, sizeof(struct process_group));
-    if (!pg)
+    if (!servername || !pg_handle)
         return -1;
 
-    /*TODO:
-    Determine:
-        pg->rank
-        pg->num_processes
-    And therefore:
-        next_rank=(rank+1)%P
-        prev_rank=(rank-1+P)%P
-    */
-    pg->next_pid = (pg->pid + 1) % pg->num_processes;
-    pg->prev_pid = (pg->pid - 1 + pg->num_processes) % pg->num_processes;
+    *pg_handle = nullptr;
 
-    if (init_rdma_resources(pg))
+    int rank;
+    std::vector<std::string> servers;
+
+    if (parse_server_config(servername, &rank, &servers))
     {
-        free(pg);
+        fprintf(stderr, "Invalid Server configuration\n");
         return -1;
     }
 
-    if (connect_qps(pg, servername))
+    struct process_group *pg = (struct process_group *)calloc(1, sizeof(struct process_group));
+
+    if (!pg)
+        return -1;
+
+    pg->pid = rank;
+    pg->num_processes = (int)servers.size();
+
+    pg->next_pid = (rank + 1) % pg->num_processes;
+    pg->prev_pid = (rank - 1 + pg->num_processes) % pg->num_processes;
+
+    pg->pending_count = 0;
+
+    const std::string &next_server = servers[pg->next_pid];
+
+    if (init_rdma_resources(pg))
     {
-        free(pg);
+        pg_close(pg);
+        return -1;
+    }
+
+    if (connect_qps(pg, next_server.c_str()))
+    {
+        pg_close(pg);
         return -1;
     }
 
@@ -624,7 +719,7 @@ static int send_eager(struct process_group *pg, void *buffer, size_t size, struc
     struct ibv_send_wr wr;
     memset(&wr, 0, sizeof(wr));
 
-    wr.wr_id = 1;
+    wr.wr_id = WR_EAGER_SEND;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
@@ -642,18 +737,49 @@ static int send_eager(struct process_group *pg, void *buffer, size_t size, struc
     return 0;
 }
 
+static int receive_eager(struct process_group *pg,
+                         void *buffer,
+                         size_t size,
+                         struct ibv_mr *mr)
+{
+    if (post_receive(pg, pg->prev_qp, buffer, size, mr, WR_EAGER_RECV))
+    {
+        fprintf(stderr, "Failed to post Eager receive\n");
+        return -1;
+    }
+
+    struct ibv_wc wc;
+    if (wait_for_completion(pg, WR_EAGER, RECV, &wc))
+    {
+        fprintf(stderr, "Failed waiting for Eager receive\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 /*Rendezvous helper function
     - Wait for a spesific Randezuos control message*/
 static int wait_for_control_message(struct process_group *pg,
+                                    struct ibv_qp *qp,
                                     control_type expected_type)
 {
+    uint64_t wr_id;
+
+    if (qp == pg->next_qp)
+        wr_id = WR_CONTROL_RECV_NEXT;
+    else if (qp == pg->prev_qp)
+        wr_id = WR_CONTROL_RECV_PREV;
+    else
+        return -1;
+
     /* Prepare to receive the control message */
     if (post_receive(pg,
-                     pg->next_qp,
+                     qp,
                      pg->control_recv_buffer,
                      sizeof(struct control_message),
                      pg->control_recv_mr,
-                     2))
+                     wr_id))
     {
         return -1;
     }
@@ -661,9 +787,14 @@ static int wait_for_control_message(struct process_group *pg,
     /* Wait until the message arrives */
     struct ibv_wc wc;
 
-    if (wait_for_completion(pg, &wc))
+    if (wait_for_completion(pg, wr_id, &wc))
     {
         return -1;
+    }
+
+    if (wc.opcode != IBV_WC_RECV || wc.byte_len != sizeof(struct control_message))
+    {
+        fprintf(stderr, "Invaild control receive completion") return -1;
     }
 
     /* Verify that we received the expected control message */
@@ -676,45 +807,70 @@ static int wait_for_control_message(struct process_group *pg,
     return 0;
 }
 
+static int send_control_message(struct process_group *pg,
+                                struct ibv_qp *qp, control_type type, size_t size, uint64_t addr, uint32_t rkey)
+{
+    struct control_message *ctrl = pg->control_send_buffer;
+
+    ctrl->type = type;
+    ctrl->size = size;
+    ctrl->addr = addr;
+    ctrl->rkey = rkey;
+
+    struct ibv_sge sge = {};
+    sge.addr = (uintptr_t)ctrl;
+    sge.length = sizeof(struct control_message);
+    sge.lkey = pg->control_send_mr->lkey;
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = WR_CONTROL_SEND;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    struct ibv_send_wr *bad_wr = NULL;
+
+    if (ibv_post_send(qp, &wr, &bad_wr))
+    {
+        fprintf(stderr, "Failed to send control message\n");
+        return -1;
+    }
+
+    struct ibv_wc wc;
+
+    if (wait_for_completion(pg, WR_CONTROL_SEND, &wc))
+        return -1;
+
+    if (wc.opcode != IBV_WC_SEND)
+        return -1;
+
+    return 0;
+}
+
 /* Rendezvous */
 static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
 {
-    /* handshake */
-    struct control_message *ctrl = pg->control_send_buffer;
-    /* Send Egaer control message */
-    ctrl->type = RENDEZVOUS_REQUEST;
-    ctrl->size = size;
 
-    if (send_eager(pg,
-                   ctrl,
-                   sizeof(struct control_message),
-                   pg->control_send_mr))
-    {
+    if (send_control_message(pg, pg->next_qp, RENDEZVOUS_REQUEST, size, 0, 0))
         return -1;
-    }
 
-    /* wait for Ready message from the receiver */
-    if (wait_for_control_message(pg, RENDEZVOUS_READY))
-    {
+    if (wait_for_control_message(pg, pg->next_qp, RENDEZVOUS_READY))
         return -1;
-    }
 
     uint64_t remote_addr = pg->control_recv_buffer->addr;
     uint32_t remote_rkey = pg->control_recv_buffer->rkey;
 
     /* Describe the local buffer */
-    struct ibv_sge sge;
-    memset(&sge, 0, sizeof(sge));
-
+    struct ibv_sge sge = {};
     sge.addr = (uintptr_t)buffer;
     sge.length = size;
     sge.lkey = mr->lkey;
 
     /* Create SEND Work Request */
-    struct ibv_send_wr wr;
-    memset(&wr, 0, sizeof(wr));
+    struct ibv_send_wr wr = {};
 
-    wr.wr_id = 1;
+    wr.wr_id = WR_RDMA_WRITE;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -723,6 +879,7 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     /* Remote memory information received during Rendezvous handshake */
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = remote_rkey;
+    wr.imm_data = 0;
 
     struct ibv_send_wr *bad_wr = NULL;
 
@@ -732,22 +889,62 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
         fprintf(stderr, "Failed to post Rendezvous RDMA Write\n");
         return -1;
     }
+
+    struct ibv_wc wc;
+    if (wait_for_completion(pg, WR_RDMA_WRITE, &wc))
+        return -1;
+
+    if (wc.opcode != IBV_WC_RDMA_WRITE)
+        return -1;
+
     return 0;
 }
 
-/* Send Chunk- decide between Eager and Rendezvous */
-// static int send_chunk(struct process_group *pg, void *buffer, size_t size, uint64_t remote_addr, uint32_t rkey)
-// {
-//     const size_t EAGER_THRESHOLD = 8192; // TODO: change in the end- after benchmark.
-//     if (size <= EAGER_THRESHOLD)
-//     {
-//         return send_eager(pg, buffer, size);
-//     }
-//     else
-//     {
-//         return send_rendezvous(pg, buffer, size, remote_addr, rkey)
-//     }
-// }
+static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buffer_size, struct ibv_mr *mr)
+{
+    // Receive request from PREV
+    if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
+        return -1;
+
+    size_t incoming_size = pg->control_recv_buffer->size;
+    if (incoming_size > buffer_size)
+    {
+        fprintf(stderr, "Rendezvous message too large\n");
+        return -1;
+    }
+
+    // Post a receive WQE for WRITE_WITH_IMM
+    struct ibv_recv_wr recv_wr = {};
+    recv_wr.wr_id = WR_RDMA_WRITE_RECV;
+    recv_wr.sg_list = NULL;
+    recv_wr.num_sge = 0;
+
+    struct ibv_recv_wr *bad_recv_wr = NULL;
+
+    if (ibv_post_recv(pg->prev_qp, &recv_wr, &bad_recv_wr))
+    {
+        fprintf(stderr, "Failed to post rendezvous receive\n");
+        return -1;
+    }
+
+    // Tell PREV where to write
+    if (send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, incoming_size, (uint64_t)buffer, mr->rkey))
+        return -1;
+
+    // Wait for the RDMA Write notification
+    struct ibv_wc wc;
+
+    if (wait_for_completion(pg, WR_RDMA_WRITE_RECV, &wc))
+        return -1;
+
+    if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM)
+    {
+        fprintf(stderr, "Expected RDMA Write with Immediate\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 /* Reduce Scatter */
 static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op)
