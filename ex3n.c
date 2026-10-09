@@ -386,7 +386,7 @@ static int prepare_data_buffers(struct process_group *pg, void *recv_buf, size_t
         return -1;
     }
 
-    pg->staging_mr = ibv_reg_mr(pg->pd, pg->staging_buffer, staging_size, IBV_ACCESS_LOCAL_WRITE);
+    pg->staging_mr = ibv_reg_mr(pg->pd, pg->staging_buffer, staging_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!pg->staging_mr)
     {
         fprintf(stderr, "Failed to register staging buffer\n");
@@ -1193,7 +1193,7 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
 }
 
 /* Reduce Scatter */
-static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op)
+static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op, PROTOCOL protocol)
 {
     int P = pg->num_processes;
     int pid = pg->pid;
@@ -1218,55 +1218,75 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
         for (size_t offset = 0; offset < chunk_bytes; offset += PIPELINE_SIZE)
         {
             size_t bytes = (chunk_bytes - offset < PIPELINE_SIZE) ? chunk_bytes - offset : PIPELINE_SIZE;
-            /*
-            1. Post receive from PREV
-            */
-            if (post_receive(pg, pg->prev_qp, pg->staging_buffer, bytes, pg->staging_mr, WR_EAGER_RECV))
+            if (protocol == PROTOCOL_EAGER)
             {
-                fprintf(stderr, "Failed to post Reduce Scatter receive\n");
+                /*
+                1. Post receive from PREV
+                */
+                if (post_receive(pg, pg->prev_qp, pg->staging_buffer, bytes, pg->staging_mr, WR_EAGER_RECV))
+                {
+                    fprintf(stderr, "Failed to post Reduce Scatter receive\n");
+                    return -1;
+                }
+
+                /*
+                2. Post Send to NEXT
+                */
+                if (post_eager_send(pg, send_ptr + offset, bytes, pg->recv_mr))
+                {
+                    fprintf(stderr, "Failed to post Reduce Scatter send");
+                    return -1;
+                }
+
+                /*
+                3. Wait for receive completion
+                */
+                struct ibv_wc recv_wc;
+                if (wait_for_completion(pg, WR_EAGER_RECV, &recv_wc))
+                    return -1;
+
+                if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
+                    return -1;
+
+                /*
+                5. Ensure send completed before reusing data
+                */
+                struct ibv_wc send_wc;
+                if (wait_for_completion(pg, WR_EAGER_SEND, &send_wc))
+                    return -1;
+
+                if (send_wc.opcode != IBV_WC_SEND)
+                    return -1;
+            }
+            else if (protocol == PROTOCOL_RENDEZVOUS)
+            {
+                if (pid % 2 == 0)
+                {
+                    if (receive_rendezvous(pg, pg->staging_buffer, bytes, pg->staging_mr))
+                        return -1;
+                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+                }
+                else
+                {
+                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+                    if (receive_rendezvous(pg, pg->staging_buffer, bytes, pg->staging_mr))
+                        return -1;
+                }
+            }
+            else
+            {
                 return -1;
             }
-
-            /*
-            2. Post Send to NEXT
-            */
-            if (post_eager_send(pg, send_ptr + offset, bytes, pg->recv_mr))
-            {
-                fprintf(stderr, "Failed to post Reduce Scatter send");
-                return -1;
-            }
-
-            /*
-            3. Wait for receive completion
-            */
-            struct ibv_wc recv_wc;
-            if (wait_for_completion(pg, WR_EAGER_RECV, &recv_wc))
-                return -1;
-
-            if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
-                return -1;
-
-            /*
-            4, Reduce received data into local chunk
-            */
             reduce(recv_ptr + offset, pg->staging_buffer, (int)(bytes / elem_size), datatype, op);
-
-            /*
-            5. Ensure send completed before reusing data
-            */
-            struct ibv_wc send_wc;
-            if (wait_for_completion(pg, WR_EAGER_SEND, &send_wc))
-                return -1;
-
-            if (send_wc.opcode != IBV_WC_SEND)
-                return -1;
         }
     }
     return 0;
 }
 
 /* All Gather */
-static int all_gather(struct process_group *pg, void *recv_buffer, int count, DATATYPE datatype)
+static int all_gather(struct process_group *pg, void *recv_buffer, int count, DATATYPE datatype, PROTOCOL protocol)
 {
     const int P = pg->num_processes;
     const int pid = pg->pid;
@@ -1364,6 +1384,19 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
     if (!pg || count < 0)
         return -1;
 
+    PROTOCOL protocol = PROTOCOL_EAGER;
+    const char *env = getenv("ALLREDUCE_PROTOCOL");
+
+    if (env && strcmp(env, "rendezvous") == 0)
+    {
+        protocol = PROTOCOL_RENDEZVOUS
+    }
+    else if (env && strcmp(env, "eager") != 0)
+    {
+        fprintf(stderr, "Unknown AllReduce protocol\n");
+        return -1;
+    }
+
     size_t element_size = datatype_size(datatype);
 
     if (element_size == 0 || (op != OP_SUM && op != OP_PRODUCT))
@@ -1394,13 +1427,14 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
     int rc = 0;
 
     /* Phase 1: Reduce Scatter */
-    if (reduce_scatter(pg, recv_buf, count, datatype, op) != 0)
+    if (reduce_scatter(pg, recv_buf, count, datatype, op, protocol) != 0)
     {
         rc = -1;
     }
 
     /* Phase 2: All Gather */
-    if (rc == 0 && all_gather(pg, recv_buf, count, datatype) != 0)
+
+    if (rc == 0 && all_gather(pg, recv_buf, count, datatype, protocol) != 0)
     {
         rc = -1;
     }
