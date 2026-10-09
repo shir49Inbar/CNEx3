@@ -1,5 +1,4 @@
 #include <infiniband/verbs.h>
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -467,6 +466,25 @@ static int tcp_recv_all(int sockfd, void *buffer, size_t len)
     return 0;
 }
 
+static int tcp_accept_exchange(int listen_fd, const struct rdma_peer *local, struct rdma_peer, *remote)
+{
+    int conn_fd = accept(listen_fd, NULL, NULL);
+    if (conn_fd < 0)
+    {
+        perror("accept");
+        return -1;
+    }
+
+    // Client sends firstl server receives first.
+    if (tcp_recv_all(conn_fd, remote, sizeof(*remote)) || tcp_send_all(conn_fd, local, sizeof(*local)))
+    {
+        close(conn_fd);
+        return -1;
+    }
+
+    close(conn_fd);
+    return 0;
+}
 /*
  * Exchange RDMA information with our ring neighbors
  * and connect the two RC QPs.
@@ -516,81 +534,30 @@ static int connect_qps(struct process_group *pg,
      *
      * Process r listens on BASE_PORT + r.
      */
-    const int BASE_PORT = 18515;
+    const int PORT = 18515;
 
-    int my_port = BASE_PORT + pg->pid;
-    int next_port = BASE_PORT + pg->next_pid;
+    int listen_fd = tcp_create_listener(PORT);
 
-    /*
-     * Avoid deadlock:
-     *
-     * even ranks first listen and then connect,
-     * odd ranks first connect and then listen.
-     */
-    if ((pg->pid % 2) == 0)
+    if (listen_fd < 0)
     {
-
-        /*
-         * Previous process connects to our prev_qp.
-         */
-        if (tcp_server_exchange(my_port,
-                                &local_prev,
-                                &pg->prev))
-        {
-
-            fprintf(stderr,
-                    "Failed to exchange information with previous process\n");
-
-            return -1;
-        }
-
-        /*
-         * Connect our next_qp to the next process.
-         */
-        if (tcp_client_exchange(servername,
-                                next_port,
-                                &local_next,
-                                &pg->next))
-        {
-
-            fprintf(stderr,
-                    "Failed to exchange information with next process\n");
-
-            return -1;
-        }
+        fprintf(stderr, "Failed to create TCP listener\n");
+        return -1;
     }
-    else
+
+    if (tcp_client_exchange(servername, PORT, &local_next, &pg->next))
     {
-
-        /*
-         * Connect our next_qp to the next process.
-         */
-        if (tcp_client_exchange(servername,
-                                next_port,
-                                &local_next,
-                                &pg->next))
-        {
-
-            fprintf(stderr,
-                    "Failed to exchange information with next process\n");
-
-            return -1;
-        }
-
-        /*
-         * Previous process connects to our prev_qp.
-         */
-        if (tcp_server_exchange(my_port,
-                                &local_prev,
-                                &pg->prev))
-        {
-
-            fprintf(stderr,
-                    "Failed to exchange information with previous process\n");
-
-            return -1;
-        }
+        fprintf(stderr, "Failed to exchange information with NEXT\n");
+        close(listen_fd);
+        return -1;
     }
+
+    if (tcp_accept_exchange(listen_fd, &local_prev, &pg_prev))
+    {
+        fprintf(stderr, "Failed to exchange information with PREV\n");
+        close(listen_fd);
+        return -1;
+    }
+    close(listen_fd);
 
     /*
      * We now know the remote LID/QPN/PSN.
