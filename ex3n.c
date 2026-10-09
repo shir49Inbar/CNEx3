@@ -940,6 +940,42 @@ static int send_eager(struct process_group *pg, void *buffer, size_t size, struc
         fprintf(stderr, "Failed to post Eager SEND\n");
         return -1;
     }
+
+    struct ibv_wc wc;
+    if (wait_for_completion(pg, WR_EAGER_SEND, &wc))
+    {
+        fprintf(stderr, "Failed waiting for Eager SEND\n");
+        return -1;
+    }
+
+    if (wc.opcode != IBV_WC_SEND)
+        return -1;
+
+    return 0;
+}
+
+static int post_eager_send(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
+{
+    struct ibv_sge sge = {};
+    sge.addr = (uintptr_t)buffer;
+    sge.length = (uint32_t)size;
+    sge.lkey = mr->lkey;
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = WR_EAGER_SEND;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    struct ibv_send_wr *bad_wr = NULL;
+
+    if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
+    {
+        fprintf(stderr, "Failed to post Eager SEND\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1160,13 +1196,10 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
     int pid = pg->pid;
 
     size_t elem_size = datatype_size(datatype);
-
-    /* Simplification:
-    Assume count is divisible by P.
-    */
-
-    int chunk_count = count / P;
+    int chunk_count = (size_t)count / P;
     size_t chunk_bytes = chunk_count * elem_size;
+
+    const size_t PIPELINE_SIZE = 64 * 1024;
 
     /* Ring Reduce-Scatter requires P-1 Steps */
     for (int step = 0; step < P - 1; ++step)
@@ -1179,35 +1212,51 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
         char *send_ptr = (char *)buffer + send_chunk_index * chunk_bytes;
         char *recv_ptr = (char *)buffer + recv_chunk_index * chunk_bytes;
 
-        /*
-        TODO:
-        Pipeline: Split this chunk into smaller segments
-        */
-        size_t PIPELINE_SIZE = 64 * 1024;
         for (size_t offset = 0; offset < chunk_bytes; offset += PIPELINE_SIZE)
         {
-            size_t bytes = (offset + PIPELINE_SIZE <= chunk_bytes) ? PIPELINE_SIZE : chunk_bytes - offset;
+            size_t bytes = (chunk_bytes - offset < PIPELINE_SIZE) ? chunk_bytes - offset : PIPELINE_SIZE;
             /*
-            1. Send our segment to the NEXT process
+            1. Post receive from PREV
             */
+            if (post_receive(pg, pg->prev_qp, pg->staging_buffer, bytes, pg->staging_mr, WR_EAGER_RECV))
+            {
+                fprintf(stderr, "Failed to post Reduce Scatter receive\n");
+                return -1;
+            }
 
             /*
-            TODO:
-            send_chunk(pg, send_ptr + offset, butes, remote_addr, rkey);
+            2. Post Send to NEXT
             */
+            if (post_eager_send(pg, send_ptr + offset, bytes, pg->recv_mr))
+            {
+                fprintf(stderr, "Failed to post Reduce Scatter send");
+                return -1;
+            }
 
             /*
-            2. Wait for a segment from PREVIOUS process.
+            3. Wait for receive completion
             */
-            // TODO: Pool CQ
+            struct ibv_wc recv_wc;
+            if (wait_for_completion(pg, WR_EAGER_RECV, &recv_wc))
+                return -1;
+
+            if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
+                return -1;
 
             /*
-            3. Reduce received segment into our local chunk.
+            4, Reduce received data into local chunk
             */
+            reduce(recv_ptr + offset, pg->staging_buffer, (int)(bytes / elem_size), datatype, op);
 
             /*
-            reduce(recv_ptr + offset, pg->staging_buffer, bytes / elem_size, datatype, op);
+            5. Ensure send completed before reusing data
             */
+            struct ibv_wc send_wc;
+            if (wait_for_completion(pg, WR_EAGER_SEND, &send_wc))
+                return -1;
+
+            if (send_wc.opcode != IBV_WC_SEND)
+                return -1;
         }
     }
     return 0;
