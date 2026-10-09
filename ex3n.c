@@ -35,6 +35,12 @@ enum OPERATION
     OP_PRODUCT
 };
 
+enum PROTOCOL
+{
+    PROTOCOL_EAGER,
+    PROTOCOL_RENDEZVOUS
+};
+
 //
 enum control_type
 {
@@ -834,10 +840,7 @@ int pg_close(void *pg_handle)
     if (pg->control_recv_mr)
         ibv_dereg_mr(pg->control_recv_mr);
 
-    if (pg->recv_mr)
-        ibv_dereg_mr(pg->recv_mr);
-    if (pg->staging_mr)
-        ibv_dereg_mr(pg->staging_mr);
+    release_data_buffers(pg);
 
     /* Free memory buffers */
     if (pg->control_send_buffer)
@@ -1265,13 +1268,14 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 /* All Gather */
 static int all_gather(struct process_group *pg, void *recv_buffer, int count, DATATYPE datatype)
 {
-    int P = pg->num_processes;
-    int pid = pg->pid;
+    const int P = pg->num_processes;
+    const int pid = pg->pid;
 
-    size_t elem_size = datatype_size(datatype);
+    const size_t elem_size = datatype_size(datatype);
+    const int chunk_count = (size_t)count / P;
+    const size_t chunk_bytes = chunk_count * elem_size;
 
-    int chunk_count = count / P;
-    size_t chunk_bytes = chunk_count * elem_size;
+    const size_t SEGMENT_SIZE = 64 * 1024;
 
     /*
     Again, Ring requires P-1 steps
@@ -1284,15 +1288,70 @@ static int all_gather(struct process_group *pg, void *recv_buffer, int count, DA
         char *send_ptr = (char *)recv_buffer + send_chunk_index * chunk_bytes;
         char *recv_ptr = (char *)recv_buffer + recv_chunk_index * chunk_bytes;
 
-        /*
-        TODO:
-        Small Messages: Eager
-        Large Messages: Rendezvous
-        For large messages: RDMA Write directly into recv_ptr
-        this gives us the required zero-copy All-gather.
-        */
+        for (size_t offset = 0; offset < chunk_bytes; offset += SEGMENT_SIZE)
+        {
+            size_t bytes = (chunk_bytes - offset < SEGMENT_SIZE) ? chunk_bytes - offset : SEGMENT_SIZE;
+            if (protocol == PROTOCOL_EAGER)
+            {
+                // Receive directly into the final buffer.
+                if (post_receive(pg, pg->prev_qp, recv_ptr + offset, bytes, pg->recv_mr, WR_EAGER_RECV))
+                {
+                    fprintf(stderr, "All Gather: failed to post receive\n");
+                    return -1;
+                }
 
-        // send_chunk(...);
+                if (post_eager_send(pg, send_ptr + offset, bytes, pg->recv_mr))
+                {
+                    fprintf(stderr, "All Gather: failed to post send\n");
+                    return -1;
+                }
+
+                struct ibv_wc recv_wc = {};
+                if (wait_for_completion(pg, WR_EAGER_RECV, &recv_wc))
+                    return -1;
+
+                if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
+                    return -1;
+
+                struct ibv_wc send_wc = {};
+                if (wait_for_completion(pg, WR_EAGER_SEND, &send_wc))
+                    return -1;
+
+                if (send_wc.opcode != IBV_WC_SEND)
+                    return -1;
+            }
+            else if (protocol == PROTOCOL_RENDEZVOUS)
+            {
+                /*
+                Both sides must participate in a rendezvous:
+                - receive from PREV
+                - send to NEXT
+
+                The existing helpers are blocking, so we alternate their order by rank
+                to avoid a circular wait in an even-sized ring.
+                */
+                if (pid % 2 == 0)
+                {
+                    if (receive_rendezvous(pg, recv_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+
+                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+                }
+                else
+                {
+                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+                    if (receive_rendezvous(pg, recv_ptr + offset, bytes, pg->recv_mr))
+                        return -1;
+                }
+            }
+            else
+            {
+                fprintf(stderr, "All Gather: unsupported protocol\n");
+                return -1;
+            }
+        }
     }
     return 0;
 }
