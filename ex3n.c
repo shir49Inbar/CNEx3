@@ -19,6 +19,12 @@
 
 #define MAX_PENDING_COMPLETIONS 128
 
+#define SEGMENT_SIZE (64 * 1024)
+#define PIPELINE_DEPTH 2
+
+#define WR_PIPELINE_RECV_BASE 1000
+#define WR_PIPELINE_SEND_BASE 2000
+
 // Types Required by the API
 
 // Indication for send_buf type
@@ -226,7 +232,10 @@ static int wait_for_completion(struct process_group *pg,
             continue;
 
         if (wc.status != IBV_WC_SUCCESS)
+        {
+            fprintf(stderr, "RDMA completion failed: wr_id=%llu, status=%s (%d)\n", (unsigned long long)wc.wr_id, ibv_wc_status_str(wc.status), wc.status);
             return -1;
+        }
 
         if (wc.wr_id == expected_wr_id)
         {
@@ -373,7 +382,7 @@ static int prepare_data_buffers(struct process_group *pg, void *recv_buf, size_t
     pg->recv_buffer = recv_buf;
 
     // Temporary buffer for incoming Reduce Scatter data
-    size_t staging_size = 64 * 1024;
+    size_t staging_size = PIPELINE_DEPTH * SEGMENT_SIZE;
 
     pg->staging_buffer = malloc(staging_size);
 
@@ -792,11 +801,27 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
         return -1;
 
     std::istringstream input(config);
+    str::string first;
     std::string rank_str;
     std::string flag;
 
-    if (!(input >> rank_str >> flag))
+    if (!(input >> first))
         return -1;
+
+    bool one_based = false;
+
+    if (first == "-myindex")
+    {
+        if (!(input >> rank_str >> flag))
+            return -1;
+        one_based = true;
+    }
+    else
+    {
+        rank_str = first;
+        if (!(input >> flag))
+            return -1;
+    }
 
     if (flag != "-list")
         return -1;
@@ -804,7 +829,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     char *end = nullptr;
     long parsed_rank = strtol(rank_str.c_str(), &end, 10);
 
-    if (*end != '\0' || parsed_rank < 0)
+    if (*end != '\0' || end == rank_str.c_str())
         return -1;
 
     servers->clear();
@@ -813,7 +838,13 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     while (input >> host)
         servers->push_back(host);
 
-    if (servers->size() < 2 || parsed_rank >= (long)servers->size())
+    if (servers->size() < 2 || servers->size() != 4)
+        return -1;
+
+    if (one_based)
+        parsed_rank--;
+
+    if (parsed_rank < 0 || parsed_rank >= (long)servers->size())
         return -1;
 
     *rank = (int)parsed_rank;
@@ -828,6 +859,8 @@ int pg_close(void *pg_handle)
     if (!pg)
         return 0;
 
+    release_data_buffers(pg);
+
     /* Destroy QPs */
     if (pg->next_qp)
         ibv_destroy_qp(pg->next_qp);
@@ -839,8 +872,6 @@ int pg_close(void *pg_handle)
         ibv_dereg_mr(pg->control_send_mr);
     if (pg->control_recv_mr)
         ibv_dereg_mr(pg->control_recv_mr);
-
-    release_data_buffers(pg);
 
     /* Free memory buffers */
     if (pg->control_send_buffer)
@@ -976,6 +1007,31 @@ static int post_eager_send(struct process_group *pg, void *buffer, size_t size, 
     if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
     {
         fprintf(stderr, "Failed to post Eager SEND\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int post_eager_send_with_id(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr, uint64_t wr_id)
+{
+    struct ibv_sge sge = {};
+    sge.addr = (uintptr_t)buffer;
+    sge.length = (uint32_t)size;
+    sge.lkey = mr->lkey;
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = wr_id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    struct ibv_send_wr *bad_wr = nullptr;
+
+    if (ibv_post_send(pg->next_qp, &wr, &bad_wr) != 0)
+    {
+        fprintf(stderr, "Failed to post pipeline send\n");
         return -1;
     }
 
@@ -1153,7 +1209,7 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
         return -1;
 
     size_t incoming_size = pg->control_recv_buffer->size;
-    if (incoming_size > buffer_size)
+    if (incoming_size != buffer_size)
     {
         fprintf(stderr, "Rendezvous message too large\n");
         return -1;
@@ -1195,75 +1251,101 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
 /* Reduce Scatter */
 static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op, PROTOCOL protocol)
 {
-    int P = pg->num_processes;
-    int pid = pg->pid;
+    const int P = pg->num_processes;
+    const int pid = pg->pid;
 
-    size_t elem_size = datatype_size(datatype);
-    int chunk_count = (size_t)count / P;
-    size_t chunk_bytes = chunk_count * elem_size;
+    const size_t elem_size = datatype_size(datatype);
+    const size_t chunk_count = (size_t)count / P;
+    const size_t chunk_bytes = chunk_count * elem_size;
 
-    const size_t PIPELINE_SIZE = 64 * 1024;
+    char *staging = (char *)pg->staging_buffer;
 
-    /* Ring Reduce-Scatter requires P-1 Steps */
     for (int step = 0; step < P - 1; ++step)
     {
-        /* Determine which chunk I send and which chunk I receive */
-        int send_chunk_index = (pid - step - 1 + P) % P;
-        int recv_chunk_index = (pid - step - 2 + P) % P;
+        const int send_chunk_index = (pid - step - 1 + P) % P;
 
-        /* ptrs to the send and recv chunks */
+        const int recv_chunk_index = (pid - step - 2 + P) % P;
+
         char *send_ptr = (char *)buffer + send_chunk_index * chunk_bytes;
+
         char *recv_ptr = (char *)buffer + recv_chunk_index * chunk_bytes;
 
-        for (size_t offset = 0; offset < chunk_bytes; offset += PIPELINE_SIZE)
+        const size_t num_segments = (chunk_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+
+        if (protocol == PROTOCOL_EAGER)
         {
-            size_t bytes = (chunk_bytes - offset < PIPELINE_SIZE) ? chunk_bytes - offset : PIPELINE_SIZE;
-            if (protocol == PROTOCOL_EAGER)
+            // Post the first receive and send.
+            const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
+
+            if (post_receive(pg, pg->prev_qp, staging, first_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE))
+                return -1;
+
+            if (post_eager_send_with_id(pg, send_ptr, first_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE))
+                return -1;
+
+            for (size_t segment = 0; segment < num_segments; ++segment)
             {
-                /*
-                1. Post receive from PREV
-                */
-                if (post_receive(pg, pg->prev_qp, pg->staging_buffer, bytes, pg->staging_mr, WR_EAGER_RECV))
-                {
-                    fprintf(stderr, "Failed to post Reduce Scatter receive\n");
-                    return -1;
-                }
+                const size_t slot = segment % PIPELINE_DEPTH;
+                const size_t offset = segment * SEGMENT_SIZE;
 
-                /*
-                2. Post Send to NEXT
-                */
-                if (post_eager_send(pg, send_ptr + offset, bytes, pg->recv_mr))
-                {
-                    fprintf(stderr, "Failed to post Reduce Scatter send");
-                    return -1;
-                }
+                const size_t bytes = chunk_bytes - offset < SEGMENT_SIZE ? chunk_bytes - offset : SEGMENT_SIZE;
 
-                /*
-                3. Wait for receive completion
-                */
-                struct ibv_wc recv_wc;
-                if (wait_for_completion(pg, WR_EAGER_RECV, &recv_wc))
+                char *current_staging = staging + slot * SEGMENT_SIZE;
+
+                struct ibv_wc recv_wc = {};
+
+                if (wait_for_completion(pg, WR_PIPELINE_RECV_BASE + slot, &recv_wc))
                     return -1;
 
                 if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
                     return -1;
 
-                /*
-                5. Ensure send completed before reusing data
-                */
-                struct ibv_wc send_wc;
-                if (wait_for_completion(pg, WR_EAGER_SEND, &send_wc))
+                // Start transferring the next segment before
+                // reducing the current segment.
+                if (segment + 1 < num_segments)
+                {
+                    const size_t next_segment = segment + 1;
+                    const size_t next_slot = next_segment % PIPELINE_DEPTH;
+
+                    const size_t next_offset = next_segment * SEGMENT_SIZE;
+
+                    const size_t next_bytes = chunk_bytes - next_offset < SEGMENT_SIZE ? chunk_bytes - next_offset : SEGMENT_SIZE;
+
+                    char *next_staging = staging + next_slot * SEGMENT_SIZE;
+
+                    if (post_receive(pg, pg->prev_qp, next_staging, next_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE + next_slot))
+                        return -1;
+
+                    if (post_eager_send_with_id(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE + next_slot))
+                        return -1;
+                }
+
+                // The next transfer can progress while
+                // we reduce the current segment.
+                reduce(recv_ptr + offset, current_staging, (int)(bytes / elem_size), datatype, op);
+
+                struct ibv_wc send_wc = {};
+
+                if (wait_for_completion(pg, WR_PIPELINE_SEND_BASE + slot, &send_wc))
                     return -1;
 
                 if (send_wc.opcode != IBV_WC_SEND)
                     return -1;
             }
-            else if (protocol == PROTOCOL_RENDEZVOUS)
+        }
+        else if (protocol == PROTOCOL_RENDEZVOUS)
+        {
+            for (size_t segment = 0; segment < num_segments; ++segment)
             {
+                const size_t offset = segment * SEGMENT_SIZE;
+
+                const size_t bytes = chunk_bytes - offset < SEGMENT_SIZE ? chunk_bytes - offset : SEGMENT_SIZE;
+
                 if (pid % 2 == 0)
                 {
-                    if (receive_rendezvous(pg, pg->staging_buffer, bytes, pg->staging_mr))
+                    if (receive_rendezvous(pg, staging, bytes, pg->staging_mr))
                         return -1;
+
                     if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
                         return -1;
                 }
@@ -1271,17 +1353,21 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
                 {
                     if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
                         return -1;
-                    if (receive_rendezvous(pg, pg->staging_buffer, bytes, pg->staging_mr))
+
+                    if (receive_rendezvous(pg, staging, bytes, pg->staging_mr))
                         return -1;
                 }
+
+                reduce(recv_ptr + offset, staging, (int)(bytes / elem_size), datatype, op);
             }
-            else
-            {
-                return -1;
-            }
-            reduce(recv_ptr + offset, pg->staging_buffer, (int)(bytes / elem_size), datatype, op);
+        }
+        else
+        {
+            fprintf(stderr, "Unsupported protocol\n");
+            return -1;
         }
     }
+
     return 0;
 }
 
@@ -1294,8 +1380,6 @@ static int all_gather(struct process_group *pg, void *recv_buffer, int count, DA
     const size_t elem_size = datatype_size(datatype);
     const int chunk_count = (size_t)count / P;
     const size_t chunk_bytes = chunk_count * elem_size;
-
-    const size_t SEGMENT_SIZE = 64 * 1024;
 
     /*
     Again, Ring requires P-1 steps
@@ -1385,7 +1469,7 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
         return -1;
 
     PROTOCOL protocol = PROTOCOL_EAGER;
-    
+
     const char *env = getenv("ALLREDUCE_PROTOCOL");
 
     if (env && strcmp(env, "rendezvous") == 0)
