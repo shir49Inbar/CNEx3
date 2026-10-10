@@ -801,7 +801,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
         return -1;
 
     std::istringstream input(config);
-    str::string first;
+    std::string first;
     std::string rank_str;
     std::string flag;
 
@@ -838,7 +838,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     while (input >> host)
         servers->push_back(host);
 
-    if (servers->size() < 2 || servers->size() != 4)
+    if (servers->size() < 2 && servers->size() != 4)
         return -1;
 
     if (one_based)
@@ -1160,6 +1160,12 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     if (wait_for_control_message(pg, pg->next_qp, RENDEZVOUS_READY))
         return -1;
 
+    if (pg->control_recv_buffer->size != size)
+    {
+        fprintf(stderr, "Rendezvous READY size mismatch\n");
+        return -1;
+    }
+
     uint64_t remote_addr = pg->control_recv_buffer->addr;
     uint32_t remote_rkey = pg->control_recv_buffer->rkey;
 
@@ -1211,7 +1217,7 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
     size_t incoming_size = pg->control_recv_buffer->size;
     if (incoming_size != buffer_size)
     {
-        fprintf(stderr, "Rendezvous message too large\n");
+        fprintf(stderr, "Rendezvous message size mismatch\n");
         return -1;
     }
 
@@ -1294,7 +1300,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 
                 struct ibv_wc recv_wc = {};
 
-                if (wait_for_completion(pg, WR_PIPELINE_RECV_BASE + slot, &recv_wc))
+                if (wait_for_completion(pg, WR_PIPELINE_RECV_BASE + segment, &recv_wc))
                     return -1;
 
                 if (recv_wc.opcode != IBV_WC_RECV || recv_wc.byte_len != bytes)
@@ -1326,7 +1332,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 
                 struct ibv_wc send_wc = {};
 
-                if (wait_for_completion(pg, WR_PIPELINE_SEND_BASE + slot, &send_wc))
+                if (wait_for_completion(pg, WR_PIPELINE_SEND_BASE + segment, &send_wc))
                     return -1;
 
                 if (send_wc.opcode != IBV_WC_SEND)
