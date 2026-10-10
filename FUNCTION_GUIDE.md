@@ -1,7 +1,7 @@
 # Function Guide
 
 This document explains the structures and functions in `allreduce.h`,
-`ex3n.cpp`, and `main.cpp`.
+`allreduce.cpp`, and `main.cpp`.
 
 ## Execution Flow
 
@@ -39,7 +39,7 @@ Declared in `allreduce.h`.
 
 ### `PROTOCOL`
 
-Private to `ex3n.cpp`.
+Private to `allreduce.cpp`.
 
 - `PROTOCOL_EAGER` uses Verbs SEND/RECV.
 - `PROTOCOL_RENDEZVOUS` uses a control-message handshake followed by RDMA

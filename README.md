@@ -52,7 +52,7 @@ flowchart TD
 
     Pipeline --> AllGather["All Gather: P - 1 steps"]
     AllGather --> FinalBuffer["Complete result in recv_buf"]
-    FinalBuffer --> Release["Deregister temporary data buffers"]
+    FinalBuffer --> Cached["Keep receive MR cached"]
 
     Main --> Close["pg_close"]
     Close --> Cleanup["Destroy QPs, CQ, MRs, PD, and context"]
@@ -95,10 +95,11 @@ progress while the CPU performs the current reduction.
 | File | Purpose |
 |---|---|
 | `allreduce.h` | Public datatypes, operations, and API declarations. |
-| `ex3n.cpp` | RDMA setup, protocols, collectives, and cleanup. |
-| `main.cpp` | Minimal correctness and timing test for both protocols. |
+| `allreduce.cpp` | RDMA setup, protocols, collectives, and cleanup. |
+| `main.cpp` | Correctness benchmark across message sizes for both protocols. |
 | `Makefile` | Builds the `test` executable. |
 | `FUNCTION_GUIDE.md` | Function-by-function implementation guide. |
+| `SUBMISSION_INTERVIEW_GUIDE.md` | Submission checklist and interview preparation. |
 
 ## Requirements
 
@@ -139,32 +140,32 @@ list and run the same tests in the same order.
 
 ### Two processes
 
-On `mlxstud01`:
+On `mlx-stud-01`:
 
 ```bash
-./test -myindex 01 -list mlxstud01 mlxstud02
+./test -myindex 01 -list mlx-stud-01 mlx-stud-02
 ```
 
-On `mlxstud02`:
+On `mlx-stud-02`:
 
 ```bash
-./test -myindex 02 -list mlxstud01 mlxstud02
+./test -myindex 02 -list mlx-stud-01 mlx-stud-02
 ```
 
 ### Four processes
 
 ```bash
-# mlxstud01
-./test -myindex 01 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
+# mlx-stud-01
+./test -myindex 01 -list mlx-stud-01 mlx-stud-02 mlx-stud-03 mlx-stud-04
 
-# mlxstud02
-./test -myindex 02 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
+# mlx-stud-02
+./test -myindex 02 -list mlx-stud-01 mlx-stud-02 mlx-stud-03 mlx-stud-04
 
-# mlxstud03
-./test -myindex 03 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
+# mlx-stud-03
+./test -myindex 03 -list mlx-stud-01 mlx-stud-02 mlx-stud-03 mlx-stud-04
 
-# mlxstud04
-./test -myindex 04 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
+# mlx-stud-04
+./test -myindex 04 -list mlx-stud-01 mlx-stud-02 mlx-stud-03 mlx-stud-04
 ```
 
 The programs should be started close together because each client retries its
@@ -240,4 +241,6 @@ The `ALLREDUCE_PROTOCOL` environment variable must be either `eager` or
 - A receive buffer must remain allocated until a different receive buffer is
   registered by a later call or until `pg_close`.
 
-See [FUNCTION_GUIDE.md](FUNCTION_GUIDE.md) for implementation details.
+See [FUNCTION_GUIDE.md](FUNCTION_GUIDE.md) for implementation details and
+[SUBMISSION_INTERVIEW_GUIDE.md](SUBMISSION_INTERVIEW_GUIDE.md) for the
+submission checklist and interview preparation.

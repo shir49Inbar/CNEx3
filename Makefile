@@ -6,8 +6,8 @@ LDLIBS ?= -libverbs
 
 all: test
 
-test: ex3n.cpp main.cpp allreduce.h
-	$(CXX) $(CXXFLAGS) ex3n.cpp main.cpp -o $@ $(LDLIBS)
+test: allreduce.cpp main.cpp allreduce.h
+	$(CXX) $(CXXFLAGS) allreduce.cpp main.cpp -o $@ $(LDLIBS)
 
 clean:
 	$(RM) test

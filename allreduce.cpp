@@ -252,7 +252,7 @@ static int wait_for_completion(struct process_group *pg,
     }
 }
 
-/* RDMA Initialization */
+/* RDMA resource initialization */
 static int init_rdma_resources(struct process_group *pg)
 {
     struct ibv_device **dev_list = NULL;
