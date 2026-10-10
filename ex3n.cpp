@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cerrno>
-#include <climit>
+#include <climits>
 #include <string>
 #include <vector>
 #include <sstream>
