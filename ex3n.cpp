@@ -1408,7 +1408,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
                 if (segment + 1 < num_segments)
                 {
                     const size_t next_offset = (segment + 1) * SEGMENT_SIZE;
-                    const size_t next_bytes = chunk_bytes - next_offset < SEGMENT_SIZE;
+                    const size_t next_bytes = (chunk_bytes - next_offset < SEGMENT_SIZE) ? chunk_bytes - next_offset : SEGMENT_SIZE;
 
                     char *next_staging = staging + ((segment + 1) % PIPELINE_DEPTH) * SEGMENT_SIZE;
 
