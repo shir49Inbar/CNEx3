@@ -10,15 +10,15 @@ flowchart TD
     A["main"] --> B["connect_process_group"]
     B --> C["init_rdma_resources"]
     B --> D["connect_qps"]
-    A --> E["run_test: eager"]
+    A --> E["run_benchmark: eager"]
     E --> F["pg_all_reduce"]
-    A --> G["run_test: rendezvous"]
+    A --> G["run_benchmark: rendezvous"]
     G --> F
     F --> H["prepare_data_buffers"]
     H --> I["reduce_scatter"]
     I --> J["all_gather"]
-    J --> K["release_data_buffers"]
     A --> L["pg_close"]
+    L --> K["release_data_buffers"]
 ```
 
 ## Public Types
@@ -71,6 +71,14 @@ Carries the Rendezvous handshake:
 - `addr`: receiver virtual address.
 - `rkey`: receiver memory-region remote key.
 
+### `remote_region`
+
+Stores chunk-level Rendezvous metadata returned by a READY message:
+
+- Remote base address.
+- Remote key.
+- Logical chunk size.
+
 ### `rdma_peer`
 
 Stores information exchanged during TCP bootstrap:
@@ -91,6 +99,7 @@ The private object returned through `pg_handle`. It contains:
 - Shared completion queue.
 - Queue pairs to the previous and next processes.
 - Registered receive and staging buffers.
+- Capacity of the currently registered receive buffer.
 - Registered Rendezvous control buffers.
 - Previous and next peer connection information.
 - A small array for completions that arrived before the completion currently
@@ -150,30 +159,31 @@ Creates resources that live for the entire process group:
 3. Allocates a protection domain.
 4. Creates a shared completion queue.
 5. Allocates and registers control send and receive buffers.
-6. Creates one reliable-connected QP for NEXT.
-7. Creates one reliable-connected QP for PREV.
+6. Allocates and registers the two-slot staging buffer.
+7. Creates one reliable-connected QP for NEXT.
+8. Creates one reliable-connected QP for PREV.
 
 ### `prepare_data_buffers`
 
-Called at the start of each All-Reduce:
+Called at the start of each All-Reduce. It reuses the current receive MR when
+the buffer pointer is unchanged and the registered capacity is large enough.
+If the pointer changes or the requested size grows, it deregisters the old MR
+and registers the new range for local and remote writes.
 
-- Registers the user receive buffer for local and remote writes.
-- Allocates a staging area containing two 64 KiB pipeline slots.
-- Registers the staging area for local and remote writes.
-
-The implementation sends data from `recv_buf`, after the user contribution is
-copied into it, so one registered data memory region is sufficient.
+The staging buffer is not handled here; it is allocated and registered once
+by `init_rdma_resources`.
 
 ### `release_data_buffers`
 
-Deregisters the per-call receive and staging memory regions, frees the staging
-buffer, and clears the stored pointers.
+Deregisters the cached receive MR and persistent staging MR, frees the staging
+buffer, and clears the stored pointers. It is used during final process-group
+cleanup rather than after every collective.
 
 ### `pg_close`
 
 Releases the complete process group:
 
-1. Releases per-call data buffers if still present.
+1. Releases the cached receive MR and persistent staging resources.
 2. Destroys both queue pairs.
 3. Deregisters both control memory regions.
 4. Frees both control buffers.
@@ -267,14 +277,6 @@ On failure, it calls `pg_close` to release partially created resources.
 
 ## Eager Protocol
 
-### `send_eager`
-
-Blocking Eager sender. It posts `IBV_WR_SEND` to `next_qp`, waits for the send
-completion, and verifies the completion opcode.
-
-This helper is currently available for simple blocking transfers; the
-collective pipeline uses the nonblocking posting helpers instead.
-
 ### `post_eager_send`
 
 Posts an Eager SEND with the standard Eager work-request ID and returns
@@ -285,12 +287,6 @@ send completions.
 
 Posts an Eager SEND with a caller-provided ID. Reduce Scatter uses segment
 numbers in these IDs so multiple pipeline operations can be distinguished.
-
-### `receive_eager`
-
-Blocking Eager receiver. It posts a receive on `prev_qp` and waits for its
-completion. The current collective pipeline posts and waits explicitly
-instead of calling this convenience helper.
 
 ## Rendezvous Protocol
 
@@ -305,46 +301,53 @@ expected control-message type.
 Fills the registered control send buffer, posts an `IBV_WR_SEND` on the
 selected QP, and waits until that small control message has been sent.
 
-### `begin_send_rendezvous`
+### `request_remote_region`
 
-Starts the sender side without waiting for the data-write completion:
+Performs the sender side of the chunk-level handshake:
 
-1. Sends `RENDEZVOUS_REQUEST`.
-2. Waits for `RENDEZVOUS_READY`.
-3. Reads the destination address and rkey.
-4. Posts `IBV_WR_RDMA_WRITE_WITH_IMM` with the supplied work-request ID.
-5. Returns while the data transfer can still be in progress.
+1. Sends one `RENDEZVOUS_REQUEST` containing the complete chunk size.
+2. Waits for one `RENDEZVOUS_READY`.
+3. Validates the returned size.
+4. Stores the remote base address and rkey in `remote_region`.
 
-### `finish_send_rendezvous`
+No data Work Request is posted by this function.
 
-Waits for the RDMA Write completion matching the supplied work-request ID and
-verifies that its opcode is `IBV_WC_RDMA_WRITE`.
+### `post_rendezvous_notification`
 
-### `send_rendezvous`
+Posts a zero-SGE receive WQE on `prev_qp`. A remote
+`IBV_WR_RDMA_WRITE_WITH_IMM` consumes this WQE and creates the segment
+completion.
 
-Blocking convenience wrapper used by All Gather. It calls
-`begin_send_rendezvous` and immediately calls `finish_send_rendezvous`.
+### `advertise_local_region`
 
-### `begin_receive_rendezvous`
-
-Starts the receiver side:
+Performs the receiver side of the chunk-level handshake:
 
 1. Waits for `RENDEZVOUS_REQUEST`.
-2. Validates the requested size.
-3. Posts a zero-SGE receive WQE for the Write-with-Immediate notification.
-4. Sends `RENDEZVOUS_READY` containing the target address and rkey.
+2. Validates the complete chunk size.
+3. Posts the first segment notification receive.
+4. Sends one `RENDEZVOUS_READY` containing the local base address and rkey.
 
-The data itself is written directly by the remote RDMA operation.
+Reduce Scatter advertises the staging-buffer base. All Gather advertises the
+final destination chunk in `recv_buf`.
 
-### `finish_receive_rendezvous`
+### `post_rendezvous_write`
 
-Waits for the matching Write-with-Immediate receive completion and verifies
-the `IBV_WC_RECV_RDMA_WITH_IMM` opcode.
+Posts one segment as `IBV_WR_RDMA_WRITE_WITH_IMM`. The caller supplies the
+remote address, rkey, work-request ID, and segment number. The segment number
+is placed in immediate data so the receiver can validate ordering.
 
-### `receive_rendezvous`
+### `finish_rendezvous_write`
 
-Blocking convenience wrapper used by All Gather. It calls
-`begin_receive_rendezvous` followed by `finish_receive_rendezvous`.
+Waits for a segment's local RDMA Write completion and verifies the
+`IBV_WC_RDMA_WRITE` opcode.
+
+### `finish_rendezvous_notification`
+
+Waits for the incoming Write-with-Immediate completion. It verifies:
+
+- `IBV_WC_RECV_RDMA_WITH_IMM`
+- Presence of immediate data
+- The expected segment number
 
 ## Collective Operations
 
@@ -363,10 +366,12 @@ round-robin arrangement.
 For Eager, the next SEND and receive are posted before reducing the current
 segment.
 
-For Rendezvous, each segment has unique send and receive IDs. The next
-handshake and RDMA Write are started before reducing the current segment, and
-the current send completion is collected after reduction. Rank parity chooses
-send-first or receive-first ordering to avoid circular waits.
+For Rendezvous, rank parity chooses which side performs the single chunk
+handshake first. The READY message advertises the staging-buffer base and
+rkey. Segment writes alternate between the two staging slots using remote
+address offsets. The next notification receive and RDMA Write are posted
+before reducing the current segment, and the current send completion is
+collected after reduction.
 
 After `P - 1` steps, each process owns one completely reduced chunk.
 
@@ -377,8 +382,10 @@ process has the complete result.
 
 - Eager posts a receive directly into the destination chunk, posts SEND, and
   waits for both completions.
-- Rendezvous writes directly into the final destination chunk in `recv_buf`.
-  This is the large-message zero-copy path.
+- Rendezvous performs one handshake per chunk, then writes every segment to
+  `remote_base + offset` in the final destination chunk. The next segment is
+  posted before the previous send completion is collected. This is the
+  large-message zero-copy path.
 
 ### `pg_all_reduce`
 
@@ -388,28 +395,42 @@ Public collective API:
 2. Chooses Eager or Rendezvous from `ALLREDUCE_PROTOCOL`.
 3. Requires `count` to be divisible by the ring size.
 4. Copies `send_buf` into `recv_buf` unless the call is in place.
-5. Registers data and staging buffers.
+5. Reuses or grows the cached receive-buffer MR.
 6. Calls `reduce_scatter`.
 7. Calls `all_gather`.
-8. Releases per-call registered memory.
 
 It returns zero on success and `-1` on failure.
 
+The receive buffer must remain allocated until a later call registers a
+different buffer or until `pg_close`.
+
 ## Test Program
 
-### `run_test`
+### `benchmark_result`
 
-Runs one protocol test:
+Stores the outcome of one protocol and message-size benchmark:
+
+- Correctness status.
+- Average latency in milliseconds.
+- Minimum latency in milliseconds.
+
+### `verify_result`
+
+Checks every element in a receive buffer against the expected All-Reduce
+result and reports the first mismatch.
+
+### `run_benchmark`
+
+Runs one protocol at one message size:
 
 1. Sets `ALLREDUCE_PROTOCOL`.
-2. Allocates an integer input and output buffer.
-3. Fills every input element with `rank + 1`.
-4. Calls `pg_all_reduce` with `TYPE_INT32` and `OP_SUM`.
-5. Checks every output element against `P * (P + 1) / 2`.
-6. Prints elapsed time from rank zero.
-
-The count is `P * 65536`, producing a 256 KiB chunk per process and four
-64 KiB pipeline segments.
+2. Uses the persistent maximum-sized input and output vectors owned by
+   `main`.
+3. Fills the active input range with `rank + 1`.
+4. Runs one unmeasured warm-up All-Reduce.
+5. Runs five measured All-Reduce iterations.
+6. Checks every output element after every call.
+7. Returns average latency, minimum latency, and correctness status.
 
 ### `main`
 
@@ -419,7 +440,10 @@ The executable entry point:
 2. Determines the local rank and process count.
 3. Reconstructs the configuration string for `connect_process_group`.
 4. Connects the RDMA ring.
-5. Runs the Eager test.
-6. Runs the Rendezvous test.
-7. Calls `pg_close`.
-8. Returns nonzero if setup, either test, or cleanup fails.
+5. Allocates maximum-sized send and receive vectors once.
+6. Starts with one `int32_t` element per process.
+7. Doubles the total message size until 1 MiB.
+8. Benchmarks Eager and Rendezvous at each size.
+9. Prints a comparison table from rank zero.
+10. Calls `pg_close` while the registered receive vector is still alive.
+11. Returns nonzero if setup, any benchmark, or cleanup fails.

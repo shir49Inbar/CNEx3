@@ -18,8 +18,10 @@ The implementation supports:
 - `OP_SUM` and `OP_PRODUCT`.
 - Eager communication using `IBV_WR_SEND`.
 - Rendezvous communication using `IBV_WR_RDMA_WRITE_WITH_IMM`.
+- One Rendezvous REQUEST/READY handshake per ring chunk.
 - Two-buffer pipelining with 64 KiB segments during Reduce Scatter.
 - Zero-copy Rendezvous All Gather directly into the final receive buffer.
+- A persistent registered staging buffer and cached receive-buffer registration.
 
 ## Architecture
 
@@ -41,7 +43,7 @@ flowchart TD
     Exchange --> QPState["QP states: INIT -> RTR -> RTS"]
 
     Main --> AllReduce["pg_all_reduce"]
-    AllReduce --> Register["Register receive and staging buffers"]
+    AllReduce --> Register["Reuse cached receive MR<br/>and persistent staging MR"]
     Register --> ReduceScatter["Reduce Scatter: P - 1 steps"]
     ReduceScatter --> Eager["Eager SEND / RECV"]
     ReduceScatter --> Rendezvous["Rendezvous RDMA Write + Immediate"]
@@ -73,17 +75,20 @@ sequenceDiagram
     participant Sender
     participant Receiver
 
-    Sender->>Receiver: RENDEZVOUS_REQUEST(size)
-    Receiver->>Receiver: Post receive for Write-with-Immediate
-    Receiver-->>Sender: RENDEZVOUS_READY(address, rkey)
-    Sender->>Receiver: RDMA Write with Immediate
-    Sender->>Sender: Send completion
-    Receiver->>Receiver: Receive completion
+    Sender->>Receiver: RENDEZVOUS_REQUEST(chunk size)
+    Receiver->>Receiver: Post notification receive for segment 0
+    Receiver-->>Sender: RENDEZVOUS_READY(base address, rkey)
+    loop Every 64 KiB segment
+        Sender->>Receiver: RDMA Write with Immediate to base + offset
+        Receiver->>Receiver: Validate segment immediate value
+        Sender->>Sender: Collect write completion
+    end
 ```
 
-During pipelined Reduce Scatter, the next segment is posted before the current
-segment is reduced. Communication for segment `i + 1` can therefore progress
-while the CPU reduces segment `i`.
+REQUEST/READY is exchanged once per chunk, not once per segment. During
+pipelined Reduce Scatter, the notification receive and RDMA Write for segment
+`i + 1` are posted before segment `i` is reduced. Communication can therefore
+progress while the CPU performs the current reduction.
 
 ## Files
 
@@ -167,10 +172,25 @@ TCP bootstrap connection for approximately one minute.
 
 ## Test Program
 
-`main.cpp` runs the same `TYPE_INT32` and `OP_SUM` test twice:
+`main.cpp` benchmarks `TYPE_INT32` with `OP_SUM` using both protocols:
 
 1. `ALLREDUCE_PROTOCOL=eager`
 2. `ALLREDUCE_PROTOCOL=rendezvous`
+
+Because the API uses 32-bit elements and requires equal ring chunks, the first
+message contains one integer per process. The total message size then doubles
+until it reaches 1 MiB.
+
+For every message size and protocol, the program runs:
+
+- One unmeasured warm-up.
+- Five measured iterations.
+- A complete correctness check after every call.
+
+The benchmark allocates maximum-sized send and receive vectors once and keeps
+them alive until `pg_close`. The receive MR is reused while its pointer and
+registered capacity remain compatible. When the tested size grows, the
+unmeasured warm-up expands the registration before timing begins.
 
 Process rank `r` fills its input with `r + 1`. For `P` processes, every result
 element must equal:
@@ -179,15 +199,15 @@ element must equal:
 P * (P + 1) / 2
 ```
 
-Each process contributes 65,536 elements per ring chunk. Every chunk is
-256 KiB and is divided into four 64 KiB segments, so the test exercises the
-pipeline.
-
-Example rank-zero output:
+Rank zero prints average latency, minimum latency, Rendezvous speedup over
+Eager, and correctness status:
 
 ```text
-eager: PASS, 1.23 ms
-rendezvous: PASS, 0.87 ms
+Bytes       Eager avg ms    Eager min ms    Rendezvous avg ms   Rendezvous min ms   Speedup     Result
+16          0.1200          0.1000          0.1800              0.1600              0.6667      PASS
+32          0.1300          0.1100          0.1900              0.1700              0.6842      PASS
+...
+1048576     40.0000         38.0000         12.0000             11.0000             3.3333      PASS
 ```
 
 ## Public API
@@ -217,5 +237,7 @@ The `ALLREDUCE_PROTOCOL` environment variable must be either `eager` or
 - Completion polling is busy-wait based.
 - All processes must call collectives in the same order with identical
   arguments.
+- A receive buffer must remain allocated until a different receive buffer is
+  registered by a later call or until `pg_close`.
 
 See [FUNCTION_GUIDE.md](FUNCTION_GUIDE.md) for implementation details.

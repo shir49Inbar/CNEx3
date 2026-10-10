@@ -1,72 +1,119 @@
 #include "allreduce.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
-static bool run_test(const char *protocol,
-                     int rank,
-                     int num_processes,
-                     void *pg_handle)
+struct benchmark_result
 {
-    if (setenv("ALLREDUCE_PROTOCOL", protocol, 1) != 0)
-    {
-        std::cerr << "Failed to select protocol\n";
-        return false;
-    }
+    bool passed;
+    double average_ms;
+    double minimum_ms;
+};
 
-    const int count = num_processes * 65536;
-    const int32_t expected = num_processes * (num_processes + 1) / 2;
-
-    std::vector<int32_t> send_buffer(count, rank + 1);
-    std::vector<int32_t> recv_buffer(count, 0);
-
-    const std::chrono::steady_clock::time_point start =
-        std::chrono::steady_clock::now();
-
-    const int rc = pg_all_reduce(send_buffer.data(),
-                                 recv_buffer.data(),
-                                 count,
-                                 TYPE_INT32,
-                                 OP_SUM,
-                                 pg_handle);
-
-    const std::chrono::steady_clock::time_point end =
-        std::chrono::steady_clock::now();
-
-    if (rc != 0)
-    {
-        std::cerr << "Rank " << rank << ": " << protocol
-                  << " All-Reduce failed\n";
-        return false;
-    }
-
+static bool verify_result(const std::vector<int32_t> &buffer,
+                          int count,
+                          int32_t expected)
+{
     for (int i = 0; i < count; ++i)
     {
-        if (recv_buffer[i] != expected)
+        if (buffer[i] != expected)
         {
-            std::cerr << "Rank " << rank << ": " << protocol
-                      << " produced an incorrect result at index " << i
+            std::cerr << "Incorrect result at index " << i
                       << ": expected " << expected
-                      << ", received " << recv_buffer[i] << '\n';
+                      << ", received " << buffer[i] << '\n';
             return false;
         }
     }
 
-    if (rank == 0)
+    return true;
+}
+
+static benchmark_result run_benchmark(const char *protocol,
+                                      int rank,
+                                      int num_processes,
+                                      int count,
+                                      int iterations,
+                                      std::vector<int32_t> &send_buffer,
+                                      std::vector<int32_t> &recv_buffer,
+                                      void *pg_handle)
+{
+    benchmark_result result = {false, 0.0, 0.0};
+
+    if (setenv("ALLREDUCE_PROTOCOL", protocol, 1) != 0)
     {
+        std::cerr << "Failed to select protocol\n";
+        return result;
+    }
+
+    const int32_t expected = num_processes * (num_processes + 1) / 2;
+
+    std::fill(send_buffer.begin(), send_buffer.begin() + count, rank + 1);
+    std::fill(recv_buffer.begin(), recv_buffer.begin() + count, 0);
+
+    if (pg_all_reduce(send_buffer.data(),
+                      recv_buffer.data(),
+                      count,
+                      TYPE_INT32,
+                      OP_SUM,
+                      pg_handle) != 0)
+    {
+        std::cerr << "Rank " << rank << ": " << protocol
+                  << " warm-up failed\n";
+        return result;
+    }
+
+    if (!verify_result(recv_buffer, count, expected))
+        return result;
+
+    double total_ms = 0.0;
+    double minimum_ms = std::numeric_limits<double>::max();
+
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const std::chrono::steady_clock::time_point start =
+            std::chrono::steady_clock::now();
+
+        const int rc = pg_all_reduce(send_buffer.data(),
+                                     recv_buffer.data(),
+                                     count,
+                                     TYPE_INT32,
+                                     OP_SUM,
+                                     pg_handle);
+
+        const std::chrono::steady_clock::time_point end =
+            std::chrono::steady_clock::now();
+
+        if (rc != 0)
+        {
+            std::cerr << "Rank " << rank << ": " << protocol
+                      << " All-Reduce failed\n";
+            return result;
+        }
+
+        if (!verify_result(recv_buffer, count, expected))
+            return result;
+
         const double milliseconds =
             std::chrono::duration<double, std::milli>(end - start).count();
 
-        std::cout << protocol << ": PASS, " << milliseconds << " ms\n";
+        total_ms += milliseconds;
+        if (milliseconds < minimum_ms)
+            minimum_ms = milliseconds;
     }
 
-    return true;
+    result.passed = true;
+    result.average_ms = total_ms / iterations;
+    result.minimum_ms = minimum_ms;
+    return result;
 }
 
 int main(int argc, char **argv)
@@ -111,14 +158,92 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const bool eager_ok =
-        run_test("eager", rank, num_processes, pg_handle);
-    const bool rendezvous_ok =
-        run_test("rendezvous", rank, num_processes, pg_handle);
+    const int iterations = 5;
+    const size_t maximum_bytes = 1024 * 1024;
+    const size_t minimum_bytes =
+        static_cast<size_t>(num_processes) * sizeof(int32_t);
+    const int maximum_count =
+        static_cast<int>(maximum_bytes / sizeof(int32_t));
+
+    std::vector<int32_t> send_buffer(maximum_count);
+    std::vector<int32_t> recv_buffer(maximum_count);
+
+    if (rank == 0)
+    {
+        std::cout << "Ring All-Reduce benchmark\n"
+                  << "Processes: " << num_processes << '\n'
+                  << "Operation: INT32 SUM\n"
+                  << "Measured iterations: " << iterations << "\n\n"
+                  << std::left
+                  << std::setw(12) << "Bytes"
+                  << std::setw(16) << "Eager avg ms"
+                  << std::setw(16) << "Eager min ms"
+                  << std::setw(20) << "Rendezvous avg ms"
+                  << std::setw(20) << "Rendezvous min ms"
+                  << std::setw(12) << "Speedup"
+                  << "Result\n";
+    }
+
+    bool all_passed = true;
+
+    for (size_t message_bytes = minimum_bytes;
+         message_bytes <= maximum_bytes;
+         message_bytes *= 2)
+    {
+        const int count =
+            static_cast<int>(message_bytes / sizeof(int32_t));
+
+        const benchmark_result eager =
+            run_benchmark("eager",
+                          rank,
+                          num_processes,
+                          count,
+                          iterations,
+                          send_buffer,
+                          recv_buffer,
+                          pg_handle);
+
+        const benchmark_result rendezvous =
+            run_benchmark("rendezvous",
+                          rank,
+                          num_processes,
+                          count,
+                          iterations,
+                          send_buffer,
+                          recv_buffer,
+                          pg_handle);
+
+        const bool passed = eager.passed && rendezvous.passed;
+        all_passed = all_passed && passed;
+
+        if (rank == 0)
+        {
+            const double speedup =
+                rendezvous.average_ms > 0.0
+                    ? eager.average_ms / rendezvous.average_ms
+                    : 0.0;
+
+            std::cout << std::left
+                      << std::setw(12) << message_bytes
+                      << std::setw(16) << std::fixed << std::setprecision(4)
+                      << eager.average_ms
+                      << std::setw(16) << eager.minimum_ms
+                      << std::setw(20) << rendezvous.average_ms
+                      << std::setw(20) << rendezvous.minimum_ms
+                      << std::setw(12) << speedup
+                      << (passed ? "PASS" : "FAIL") << '\n';
+        }
+
+        if (!passed)
+            break;
+
+        if (message_bytes > maximum_bytes / 2)
+            break;
+    }
 
     const int close_rc = pg_close(pg_handle);
 
-    if (!eager_ok || !rendezvous_ok || close_rc != 0)
+    if (!all_passed || close_rc != 0)
         return 1;
 
     return 0;

@@ -67,6 +67,13 @@ struct control_message
     uint32_t rkey;
 };
 
+struct remote_region
+{
+    uint64_t addr;
+    uint32_t rkey;
+    size_t size;
+};
+
 /*
 Information about another process in the ring
 */
@@ -108,6 +115,7 @@ struct process_group
 
     struct ibv_mr *recv_mr;    // memory registrations
     struct ibv_mr *staging_mr; // memory registrations
+    size_t recv_registered_bytes;
 
     /* Control message for Rendezvous */
     struct control_message *control_send_buffer;
@@ -170,8 +178,7 @@ static void reduce(void *dst, const void *src, int count, DATATYPE datatype, OPE
 }
 
 /* RDMA Helper functions */
-static int post_receive(struct process_group *pg,
-                        struct ibv_qp *qp,
+static int post_receive(struct ibv_qp *qp,
                         void *buffer,
                         size_t size,
                         struct ibv_mr *mr,
@@ -326,6 +333,28 @@ static int init_rdma_resources(struct process_group *pg)
         return -1;
     }
 
+    const size_t staging_size = PIPELINE_DEPTH * SEGMENT_SIZE;
+
+    pg->staging_buffer = malloc(staging_size);
+    if (!pg->staging_buffer)
+    {
+        fprintf(stderr, "Failed to allocate staging buffer\n");
+        return -1;
+    }
+
+    pg->staging_mr =
+        ibv_reg_mr(pg->pd,
+                   pg->staging_buffer,
+                   staging_size,
+                   IBV_ACCESS_LOCAL_WRITE |
+                       IBV_ACCESS_REMOTE_WRITE);
+
+    if (!pg->staging_mr)
+    {
+        fprintf(stderr, "Failed to register staging buffer\n");
+        return -1;
+    }
+
     /* QP configuration */
     struct ibv_qp_init_attr qp_attr;
     memset(&qp_attr, 0, sizeof(qp_attr));
@@ -364,43 +393,35 @@ static int prepare_data_buffers(struct process_group *pg, void *recv_buf, size_t
     if (total_bytes == 0)
         return 0;
 
-    // Register the user-provided receive buffer
+    if (pg->recv_mr &&
+        pg->recv_buffer == recv_buf &&
+        pg->recv_registered_bytes >= total_bytes)
+    {
+        return 0;
+    }
+
+    if (pg->recv_mr)
+    {
+        if (ibv_dereg_mr(pg->recv_mr))
+        {
+            fprintf(stderr, "Failed to deregister previous receive buffer\n");
+            return -1;
+        }
+
+        pg->recv_mr = NULL;
+        pg->recv_buffer = NULL;
+        pg->recv_registered_bytes = 0;
+    }
+
     pg->recv_mr = ibv_reg_mr(pg->pd, recv_buf, total_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!pg->recv_mr)
     {
         fprintf(stderr, "Failed to register receive buffer\n");
         return -1;
     }
+
     pg->recv_buffer = recv_buf;
-
-    // Temporary buffer for incoming Reduce Scatter data
-    size_t staging_size = PIPELINE_DEPTH * SEGMENT_SIZE;
-
-    pg->staging_buffer = malloc(staging_size);
-
-    if (!pg->staging_buffer)
-    {
-        fprintf(stderr, "Failed to allocate staging buffer\n");
-        ibv_dereg_mr(pg->recv_mr);
-        pg->recv_mr = NULL;
-        pg->recv_buffer = NULL;
-        return -1;
-    }
-
-    pg->staging_mr = ibv_reg_mr(pg->pd, pg->staging_buffer, staging_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!pg->staging_mr)
-    {
-        fprintf(stderr, "Failed to register staging buffer\n");
-
-        free(pg->staging_buffer);
-        pg->staging_buffer = NULL;
-
-        ibv_dereg_mr(pg->recv_mr);
-        pg->recv_mr = NULL;
-        pg->recv_buffer = NULL;
-
-        return -1;
-    }
+    pg->recv_registered_bytes = total_bytes;
 
     return 0;
 }
@@ -411,6 +432,7 @@ static void release_data_buffers(struct process_group *pg)
     {
         ibv_dereg_mr(pg->recv_mr);
         pg->recv_mr = NULL;
+        pg->recv_registered_bytes = 0;
     }
 
     if (pg->staging_mr)
@@ -937,49 +959,6 @@ extern "C" int connect_process_group(char *servername, void **pg_handle)
 }
 
 /* Eager */
-static int send_eager(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
-{
-    /* Describe the local buffer */
-    struct ibv_sge sge;
-    memset(&sge, 0, sizeof(sge));
-
-    sge.addr = (uintptr_t)buffer;
-    sge.length = size;
-    sge.lkey = mr->lkey;
-
-    /* Create SEND Work Request */
-    struct ibv_send_wr wr;
-    memset(&wr, 0, sizeof(wr));
-
-    wr.wr_id = WR_EAGER_SEND;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.next = NULL;
-
-    struct ibv_send_wr *bad_wr = NULL;
-
-    /* send to the next process in the ring */
-    if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
-    {
-        fprintf(stderr, "Failed to post Eager SEND\n");
-        return -1;
-    }
-
-    struct ibv_wc wc;
-    if (wait_for_completion(pg, WR_EAGER_SEND, &wc))
-    {
-        fprintf(stderr, "Failed waiting for Eager SEND\n");
-        return -1;
-    }
-
-    if (wc.opcode != IBV_WC_SEND)
-        return -1;
-
-    return 0;
-}
-
 static int post_eager_send(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
 {
     struct ibv_sge sge = {};
@@ -1030,27 +1009,6 @@ static int post_eager_send_with_id(struct process_group *pg, void *buffer, size_
     return 0;
 }
 
-static int receive_eager(struct process_group *pg,
-                         void *buffer,
-                         size_t size,
-                         struct ibv_mr *mr)
-{
-    if (post_receive(pg, pg->prev_qp, buffer, size, mr, WR_EAGER_RECV))
-    {
-        fprintf(stderr, "Failed to post Eager receive\n");
-        return -1;
-    }
-
-    struct ibv_wc wc;
-    if (wait_for_completion(pg, WR_EAGER_RECV, &wc))
-    {
-        fprintf(stderr, "Failed waiting for Eager receive\n");
-        return -1;
-    }
-
-    return 0;
-}
-
 /*Rendezvous helper function
     - Wait for a spesific Randezuos control message*/
 static int wait_for_control_message(struct process_group *pg,
@@ -1067,8 +1025,7 @@ static int wait_for_control_message(struct process_group *pg,
         return -1;
 
     /* Prepare to receive the control message */
-    if (post_receive(pg,
-                     qp,
+    if (post_receive(qp,
                      pg->control_recv_buffer,
                      sizeof(struct control_message),
                      pg->control_recv_mr,
@@ -1143,11 +1100,9 @@ static int send_control_message(struct process_group *pg,
 }
 
 /* Rendezvous */
-static int begin_send_rendezvous(struct process_group *pg,
-                                 void *buffer,
+static int request_remote_region(struct process_group *pg,
                                  size_t size,
-                                 struct ibv_mr *mr,
-                                 uint64_t wr_id)
+                                 struct remote_region *remote)
 {
     if (send_control_message(pg, pg->next_qp, RENDEZVOUS_REQUEST, size, 0, 0))
         return -1;
@@ -1161,32 +1116,82 @@ static int begin_send_rendezvous(struct process_group *pg,
         return -1;
     }
 
-    uint64_t remote_addr = pg->control_recv_buffer->addr;
-    uint32_t remote_rkey = pg->control_recv_buffer->rkey;
+    remote->addr = pg->control_recv_buffer->addr;
+    remote->rkey = pg->control_recv_buffer->rkey;
+    remote->size = pg->control_recv_buffer->size;
+    return 0;
+}
 
-    /* Describe the local buffer */
+static int post_rendezvous_notification(struct process_group *pg, uint64_t wr_id)
+{
+    struct ibv_recv_wr wr = {};
+    wr.wr_id = wr_id;
+    wr.num_sge = 0;
+    wr.sg_list = NULL;
+
+    struct ibv_recv_wr *bad_wr = NULL;
+
+    if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
+    {
+        fprintf(stderr, "Failed to post rendezvous notification receive\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int advertise_local_region(struct process_group *pg,
+                                  void *buffer,
+                                  size_t size,
+                                  struct ibv_mr *mr,
+                                  uint64_t first_recv_wr_id)
+{
+    if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
+        return -1;
+
+    if (pg->control_recv_buffer->size != size)
+    {
+        fprintf(stderr, "Rendezvous request size mismatch\n");
+        return -1;
+    }
+
+    if (post_rendezvous_notification(pg, first_recv_wr_id))
+        return -1;
+
+    return send_control_message(pg,
+                                pg->prev_qp,
+                                RENDEZVOUS_READY,
+                                size,
+                                (uint64_t)(uintptr_t)buffer,
+                                mr->rkey);
+}
+
+static int post_rendezvous_write(struct process_group *pg,
+                                 void *buffer,
+                                 size_t size,
+                                 struct ibv_mr *mr,
+                                 uint64_t remote_addr,
+                                 uint32_t remote_rkey,
+                                 uint64_t wr_id,
+                                 uint32_t segment)
+{
     struct ibv_sge sge = {};
     sge.addr = (uintptr_t)buffer;
     sge.length = size;
     sge.lkey = mr->lkey;
 
-    /* Create SEND Work Request */
     struct ibv_send_wr wr = {};
-
     wr.wr_id = wr_id;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
-
-    /* Remote memory information received during Rendezvous handshake */
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = remote_rkey;
-    wr.imm_data = 0;
+    wr.imm_data = htonl(segment);
 
     struct ibv_send_wr *bad_wr = NULL;
 
-    /* RDMA Write to the next process in the ring */
     if (ibv_post_send(pg->next_qp, &wr, &bad_wr))
     {
         fprintf(stderr, "Failed to post Rendezvous RDMA Write\n");
@@ -1196,7 +1201,7 @@ static int begin_send_rendezvous(struct process_group *pg,
     return 0;
 }
 
-static int finish_send_rendezvous(struct process_group *pg, uint64_t wr_id)
+static int finish_rendezvous_write(struct process_group *pg, uint64_t wr_id)
 {
     struct ibv_wc wc = {};
 
@@ -1209,53 +1214,9 @@ static int finish_send_rendezvous(struct process_group *pg, uint64_t wr_id)
     return 0;
 }
 
-static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
-{
-    const uint64_t wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, 0);
-
-    if (begin_send_rendezvous(pg, buffer, size, mr, wr_id))
-        return -1;
-
-    return finish_send_rendezvous(pg, wr_id);
-}
-
-static int begin_receive_rendezvous(struct process_group *pg,
-                                    void *buffer,
-                                    size_t size,
-                                    struct ibv_mr *mr,
-                                    uint64_t wr_id)
-{
-    if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
-        return -1;
-
-    if (pg->control_recv_buffer->size != size)
-    {
-        fprintf(stderr, "Rendezvous request size mismatch\n");
-        return -1;
-    }
-
-    struct ibv_recv_wr wr = {};
-    wr.wr_id = wr_id;
-    wr.num_sge = 0;
-    wr.sg_list = NULL;
-
-    struct ibv_recv_wr *bad_wr = NULL;
-
-    if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
-    {
-        fprintf(stderr, "Failed to post rendezvous receive\n");
-        return -1;
-    }
-
-    return send_control_message(pg,
-                                pg->prev_qp,
-                                RENDEZVOUS_READY,
-                                size,
-                                (uint64_t)(uintptr_t)buffer,
-                                mr->rkey);
-}
-
-static int finish_receive_rendezvous(struct process_group *pg, uint64_t wr_id)
+static int finish_rendezvous_notification(struct process_group *pg,
+                                          uint64_t wr_id,
+                                          uint32_t expected_segment)
 {
     struct ibv_wc wc = {};
 
@@ -1268,17 +1229,14 @@ static int finish_receive_rendezvous(struct process_group *pg, uint64_t wr_id)
         return -1;
     }
 
-    return 0;
-}
-
-static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buffer_size, struct ibv_mr *mr)
-{
-    const uint64_t wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, 0);
-
-    if (begin_receive_rendezvous(pg, buffer, buffer_size, mr, wr_id))
+    if (!(wc.wc_flags & IBV_WC_WITH_IMM) ||
+        ntohl(wc.imm_data) != expected_segment)
+    {
+        fprintf(stderr, "Unexpected Rendezvous segment completion\n");
         return -1;
+    }
 
-    return finish_receive_rendezvous(pg, wr_id);
+    return 0;
 }
 
 /* Reduce Scatter */
@@ -1310,7 +1268,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
             // Post the first receive and send.
             const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
 
-            if (post_receive(pg, pg->prev_qp, staging, first_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE))
+            if (post_receive(pg->prev_qp, staging, first_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE))
                 return -1;
 
             if (post_eager_send_with_id(pg, send_ptr, first_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE))
@@ -1346,7 +1304,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 
                     char *next_staging = staging + next_slot * SEGMENT_SIZE;
 
-                    if (post_receive(pg, pg->prev_qp, next_staging, next_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE + next_segment))
+                    if (post_receive(pg->prev_qp, next_staging, next_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE + next_segment))
                         return -1;
 
                     if (post_eager_send_with_id(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE + next_segment))
@@ -1374,21 +1332,34 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
             const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
             const uint64_t first_send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, 0);
             const uint64_t first_recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, 0);
+            struct remote_region remote = {};
 
             if (pid % 2 == 0)
             {
-                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr, first_recv_wr_id))
+                if (advertise_local_region(pg, staging, chunk_bytes, pg->staging_mr, first_recv_wr_id))
                     return -1;
 
-                if (begin_send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr, first_send_wr_id))
+                if (request_remote_region(pg, chunk_bytes, &remote))
                     return -1;
             }
             else
             {
-                if (begin_send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr, first_send_wr_id))
+                if (request_remote_region(pg, chunk_bytes, &remote))
                     return -1;
-                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr, first_recv_wr_id))
+                if (advertise_local_region(pg, staging, chunk_bytes, pg->staging_mr, first_recv_wr_id))
                     return -1;
+            }
+
+            if (post_rendezvous_write(pg,
+                                      send_ptr,
+                                      first_bytes,
+                                      pg->recv_mr,
+                                      remote.addr,
+                                      remote.rkey,
+                                      first_send_wr_id,
+                                      0))
+            {
+                return -1;
             }
 
             for (size_t segment = 0; segment < num_segments; ++segment)
@@ -1400,7 +1371,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
                 const uint64_t send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, segment);
                 const uint64_t recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, segment);
 
-                if (finish_receive_rendezvous(pg, recv_wr_id))
+                if (finish_rendezvous_notification(pg, recv_wr_id, (uint32_t)segment))
                     return -1;
 
                 if (segment + 1 < num_segments)
@@ -1409,29 +1380,31 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
                     const size_t next_offset = next_segment * SEGMENT_SIZE;
                     const size_t next_bytes = (chunk_bytes - next_offset < SEGMENT_SIZE) ? chunk_bytes - next_offset : SEGMENT_SIZE;
 
-                    char *next_staging = staging + (next_segment % PIPELINE_DEPTH) * SEGMENT_SIZE;
                     const uint64_t next_send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, next_segment);
                     const uint64_t next_recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, next_segment);
+                    const uint64_t next_remote_addr =
+                        remote.addr +
+                        (next_segment % PIPELINE_DEPTH) * SEGMENT_SIZE;
 
-                    if (pid % 2 == 0)
+                    if (post_rendezvous_notification(pg, next_recv_wr_id))
+                        return -1;
+
+                    if (post_rendezvous_write(pg,
+                                              send_ptr + next_offset,
+                                              next_bytes,
+                                              pg->recv_mr,
+                                              next_remote_addr,
+                                              remote.rkey,
+                                              next_send_wr_id,
+                                              (uint32_t)next_segment))
                     {
-                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr, next_recv_wr_id))
-                            return -1;
-                        if (begin_send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, next_send_wr_id))
-                            return -1;
-                    }
-                    else
-                    {
-                        if (begin_send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, next_send_wr_id))
-                            return -1;
-                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr, next_recv_wr_id))
-                            return -1;
+                        return -1;
                     }
                 }
 
                 reduce(recv_ptr + offset, current_staging, (int)(bytes / elem_size), datatype, op);
 
-                if (finish_send_rendezvous(pg, send_wr_id))
+                if (finish_rendezvous_write(pg, send_wr_id))
                     return -1;
             }
         }
@@ -1466,13 +1439,14 @@ static int all_gather(struct process_group *pg, void *recv_buffer, int count, DA
         char *send_ptr = (char *)recv_buffer + send_chunk_index * chunk_bytes;
         char *recv_ptr = (char *)recv_buffer + recv_chunk_index * chunk_bytes;
 
-        for (size_t offset = 0; offset < chunk_bytes; offset += SEGMENT_SIZE)
+        if (protocol == PROTOCOL_EAGER)
         {
-            size_t bytes = (chunk_bytes - offset < SEGMENT_SIZE) ? chunk_bytes - offset : SEGMENT_SIZE;
-            if (protocol == PROTOCOL_EAGER)
+            for (size_t offset = 0; offset < chunk_bytes; offset += SEGMENT_SIZE)
             {
+                size_t bytes = (chunk_bytes - offset < SEGMENT_SIZE) ? chunk_bytes - offset : SEGMENT_SIZE;
+
                 // Receive directly into the final buffer.
-                if (post_receive(pg, pg->prev_qp, recv_ptr + offset, bytes, pg->recv_mr, WR_EAGER_RECV))
+                if (post_receive(pg->prev_qp, recv_ptr + offset, bytes, pg->recv_mr, WR_EAGER_RECV))
                 {
                     fprintf(stderr, "All Gather: failed to post receive\n");
                     return -1;
@@ -1498,37 +1472,94 @@ static int all_gather(struct process_group *pg, void *recv_buffer, int count, DA
                 if (send_wc.opcode != IBV_WC_SEND)
                     return -1;
             }
-            else if (protocol == PROTOCOL_RENDEZVOUS)
+        }
+        else if (protocol == PROTOCOL_RENDEZVOUS)
+        {
+            const size_t num_segments = (chunk_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+
+            if (num_segments == 0)
+                continue;
+
+            const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
+            const uint64_t first_send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, 0);
+            const uint64_t first_recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, 0);
+            struct remote_region remote = {};
+
+            if (pid % 2 == 0)
             {
-                /*
-                Both sides must participate in a rendezvous:
-                - receive from PREV
-                - send to NEXT
+                if (advertise_local_region(pg, recv_ptr, chunk_bytes, pg->recv_mr, first_recv_wr_id))
+                    return -1;
 
-                The existing helpers are blocking, so we alternate their order by rank
-                to avoid a circular wait in an even-sized ring.
-                */
-                if (pid % 2 == 0)
-                {
-                    if (receive_rendezvous(pg, recv_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
-
-                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
-                }
-                else
-                {
-                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
-                    if (receive_rendezvous(pg, recv_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
-                }
+                if (request_remote_region(pg, chunk_bytes, &remote))
+                    return -1;
             }
             else
             {
-                fprintf(stderr, "All Gather: unsupported protocol\n");
+                if (request_remote_region(pg, chunk_bytes, &remote))
+                    return -1;
+
+                if (advertise_local_region(pg, recv_ptr, chunk_bytes, pg->recv_mr, first_recv_wr_id))
+                    return -1;
+            }
+
+            if (post_rendezvous_write(pg,
+                                      send_ptr,
+                                      first_bytes,
+                                      pg->recv_mr,
+                                      remote.addr,
+                                      remote.rkey,
+                                      first_send_wr_id,
+                                      0))
+            {
                 return -1;
             }
+
+            for (size_t segment = 0; segment < num_segments; ++segment)
+            {
+                const size_t offset = segment * SEGMENT_SIZE;
+                const uint64_t send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, segment);
+                const uint64_t recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, segment);
+
+                if (finish_rendezvous_notification(pg, recv_wr_id, (uint32_t)segment))
+                    return -1;
+
+                if (segment + 1 < num_segments)
+                {
+                    const size_t next_segment = segment + 1;
+                    const size_t next_offset = next_segment * SEGMENT_SIZE;
+                    const size_t next_bytes =
+                        (chunk_bytes - next_offset < SEGMENT_SIZE)
+                            ? chunk_bytes - next_offset
+                            : SEGMENT_SIZE;
+                    const uint64_t next_send_wr_id =
+                        make_rendezvous_wr_id(WR_RDMA_WRITE, next_segment);
+                    const uint64_t next_recv_wr_id =
+                        make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, next_segment);
+
+                    if (post_rendezvous_notification(pg, next_recv_wr_id))
+                        return -1;
+
+                    if (post_rendezvous_write(pg,
+                                              send_ptr + next_offset,
+                                              next_bytes,
+                                              pg->recv_mr,
+                                              remote.addr + next_offset,
+                                              remote.rkey,
+                                              next_send_wr_id,
+                                              (uint32_t)next_segment))
+                    {
+                        return -1;
+                    }
+                }
+
+                if (finish_rendezvous_write(pg, send_wr_id))
+                    return -1;
+            }
+        }
+        else
+        {
+            fprintf(stderr, "All Gather: unsupported protocol\n");
+            return -1;
         }
     }
     return 0;
@@ -1578,8 +1609,6 @@ extern "C" int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE
     if (send_buf != recv_buf)
         memcpy(recv_buf, send_buf, bytes);
 
-    release_data_buffers(pg);
-
     if (prepare_data_buffers(pg, recv_buf, bytes) != 0)
         return -1;
 
@@ -1597,8 +1626,6 @@ extern "C" int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE
     {
         rc = -1;
     }
-
-    release_data_buffers(pg);
 
     return rc;
 }
