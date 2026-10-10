@@ -838,7 +838,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     while (input >> host)
         servers->push_back(host);
 
-    if (servers->size() < 2 && servers->size() != 4)
+    if (servers->size() != 2 && servers->size() != 4)
         return -1;
 
     if (one_based)
@@ -1254,6 +1254,40 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
     return 0;
 }
 
+static int begin_receive_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
+{
+    if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
+        return -1;
+    if (pg->control_recv_buffer->size != size)
+    {
+        fprintf(stderr, "Rendezvous request size mismatch\n");
+        return -1;
+    }
+
+    struct ibv_recv_wr wr = {};
+    wr.wr_id = WR_RDMA_WRITE_RECV;
+    wr.num_sge = 0;
+    wr.sg_list = NULL;
+
+    struct ibv_recv_wr *bad_wr = NULL;
+    if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
+        return -1;
+
+    return send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, size, (uint64_t)(uintptr)buffer, mr->rkey);
+}
+
+static int finish_receive_rendezvous(struct process_group *pg)
+{
+    struct ibv_wc wc = {};
+    if (wait_for_completion(pg, WR_RDMA_WRITE_RECV, &wc))
+        return -1;
+
+    if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM)
+        return -1;
+
+    return 0;
+}
+
 /* Reduce Scatter */
 static int reduce_scatter(struct process_group *pg, void *buffer, int count, DATATYPE datatype, OPERATION op, PROTOCOL protocol)
 {
@@ -1319,10 +1353,10 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 
                     char *next_staging = staging + next_slot * SEGMENT_SIZE;
 
-                    if (post_receive(pg, pg->prev_qp, next_staging, next_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE + next_slot))
+                    if (post_receive(pg, pg->prev_qp, next_staging, next_bytes, pg->staging_mr, WR_PIPELINE_RECV_BASE + next_segment))
                         return -1;
 
-                    if (post_eager_send_with_id(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE + next_slot))
+                    if (post_eager_send_with_id(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, WR_PIPELINE_SEND_BASE + next_segment))
                         return -1;
                 }
 
@@ -1341,30 +1375,59 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
         }
         else if (protocol == PROTOCOL_RENDEZVOUS)
         {
+            if (num_segments == 0)
+                continue;
+
+            const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
+
+            if (pid % 2 == 0)
+            {
+                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr))
+                    return -1;
+
+                if (send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr))
+                    return -1;
+            }
+            else
+            {
+                if (send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr))
+                    return -1;
+                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr))
+                    return -1;
+            }
             for (size_t segment = 0; segment < num_segments; ++segment)
             {
                 const size_t offset = segment * SEGMENT_SIZE;
 
                 const size_t bytes = chunk_bytes - offset < SEGMENT_SIZE ? chunk_bytes - offset : SEGMENT_SIZE;
+                char *current_staging = staging + (segment % PIPELINE_DEPTH) * SEGMENT_SIZE;
 
-                if (pid % 2 == 0)
+                if (finish_receive_rendezvous(pg))
+                    return -1;
+
+                if (segment + 1 < num_segments)
                 {
-                    if (receive_rendezvous(pg, staging, bytes, pg->staging_mr))
-                        return -1;
+                    const size_t next_offset = (segment + 1) * SEGMENT_SIZE;
+                    const size_t next_bytes = chunk_bytes - next_offset < SEGMENT_SIZE;
 
-                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
+                    char *next_staging = staging + ((segment + 1) % PIPELINE_DEPTH) * SEGMENT_SIZE;
+
+                    if (pid % 2 == 0)
+                    {
+                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr))
+                            return -1;
+                        if (send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr))
+                            return -1;
+                    }
+                    else
+                    {
+                        if (send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr))
+                            return -1;
+                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr))
+                            return -1;
+                    }
                 }
-                else
-                {
-                    if (send_rendezvous(pg, send_ptr + offset, bytes, pg->recv_mr))
-                        return -1;
-
-                    if (receive_rendezvous(pg, staging, bytes, pg->staging_mr))
-                        return -1;
-                }
-
-                reduce(recv_ptr + offset, staging, (int)(bytes / elem_size), datatype, op);
+                reduce(recv_ptr + offset, current_staging, (int)(bytes / elem_size), datatype, op);
             }
         }
         else
