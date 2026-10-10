@@ -1385,11 +1385,12 @@ int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, 
         return -1;
 
     PROTOCOL protocol = PROTOCOL_EAGER;
+    
     const char *env = getenv("ALLREDUCE_PROTOCOL");
 
     if (env && strcmp(env, "rendezvous") == 0)
     {
-        protocol = PROTOCOL_RENDEZVOUS
+        protocol = PROTOCOL_RENDEZVOUS;
     }
     else if (env && strcmp(env, "eager") != 0)
     {
