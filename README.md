@@ -1,390 +1,221 @@
-# Exercise 3 - Ring AllReduce with RDMA
-
-## Overview
-
-This project implements Ring AllReduce using the RDMA Verbs API.
-
-The processes are connected in a ring:
-
-    PREV <----> CURRENT <----> NEXT
-
-Each process therefore maintains two RC Queue Pairs:
-- `prev_qp` - communication with the previous process in the ring.
-- `next_qp` - communication with the next process in the ring.
-
-The final AllReduce implementation will consist of two phases:
-
-1. Reduce Scatter
-2. All Gather
-
-The exercise also compares two communication protocols:
-- Eager - for small messages.
-- Rendezvous - for large messages using RDMA Write.
-
-The implementation is single-threaded.
-
-
-## Current Status
-
-### Implemented
-
-- RDMA resource initialization
-- Creation of two RC Queue Pairs per process
-- TCP bootstrap for exchanging RDMA connection information
-- Ring connection setup
-- QP transitions: INIT -> RTR -> RTS
-- Eager send/receive
-- Rendezvous control messages
-- Rendezvous transfer using RDMA Write with Immediate
-- Local reduction operations:
-  - SUM
-  - MAX
-  - MIN
-  - int / float / double
-
-### TODO
-
-- Register the AllReduce data buffers / staging buffer
-- Process rank and number of processes
-- Reduce Scatter
-- All Gather
-- All Reduce
-- Pipelining
-- Zero-copy All Gather for large messages
-- Resource cleanup
-- Testing with 2 and 4 processes
-
-
-## Main Data Structures
-
-### `rdma_peer`
-
-Contains information about another process required for establishing
-an RDMA connection:
-
-- LID
-- QP number
-- PSN
-
-It also contains fields that can be used for RDMA operations:
-
-- remote address
-- remote key
-
-
-### `process_group`
-
-The process group is used as the `pg_handle` of the exercise API.
-
-It contains the resources required by a process to communicate with
-its neighbors:
-
-- RDMA context
-- Protection Domain
-- Completion Queue
-- QP towards NEXT
-- QP towards PREV
-- receive/staging buffers
-- registered memory regions
-- Rendezvous control buffers
-- information about the neighboring processes
-
-
-## Connection Setup
-
-### `init_rdma_resources()`
-
-Initializes the local RDMA resources.
-
-It:
-
-1. Finds an RDMA device.
-2. Opens the device.
-3. Allocates a Protection Domain.
-4. Creates a Completion Queue.
-5. Allocates and registers the Rendezvous control buffers.
-6. Creates two RC Queue Pairs:
-   - one for NEXT
-   - one for PREV
-
-
-### `tcp_create_listener()`
-
-Creates the TCP listening socket.
-
-The previous process in the ring connects to this socket during
-the bootstrap phase.
-
-
-### `tcp_client_exchange()`
-
-Connects to the NEXT process over TCP.
-
-It exchanges the RDMA connection information required to connect
-the QPs.
-
-
-### `tcp_accept_exchange()`
-
-Accepts the connection from the PREVIOUS process and exchanges
-RDMA connection information with it.
-
-
-### `connect_one_qp()`
-
-Moves one RC Queue Pair through:
-
-    RESET -> INIT -> RTR -> RTS
-
-using the connection information received during the TCP bootstrap.
-
-
-### `connect_qps()`
-
-Creates the ring connections.
-
-Each process:
-
-1. Opens its TCP listener.
-2. Connects to NEXT.
-3. Exchanges QP information with NEXT.
-4. Accepts a connection from PREV.
-5. Exchanges QP information with PREV.
-6. Connects both RDMA QPs.
-
-
-### `connect_process_group()`
-
-Public API function that creates the process group.
-
-It initializes the RDMA resources, connects the QPs, and returns
-the resulting `process_group` through `pg_handle`.
-
-
-## Completion / Receive Helpers
-
-### `post_receive()`
-
-Posts an RDMA receive Work Request on a given QP and buffer.
-
-
-### `wait_for_completion()`
-
-Polls the Completion Queue until a successful Work Completion is
-available.
-
-
-## Eager Protocol
-
-Eager is intended for small messages.
-
-The receiver provides a receive buffer in advance and the sender
-transfers the message using an RDMA SEND operation.
-
-### `send_eager()`
-
-Posts an `IBV_WR_SEND` operation to `next_qp`.
-
-Conceptually:
-
-    CURRENT ---- SEND ----> NEXT
-
-
-### `receive_eager()`
-
-Posts a receive on `prev_qp` and waits for its completion.
-
-Conceptually:
-
-    PREV ---- SEND ----> CURRENT
-
+# Exercise 3: Ring All-Reduce with RDMA
+
+This project implements a single-threaded Ring All-Reduce using the
+InfiniBand Verbs API. Processes form a ring, exchange RDMA connection
+information over TCP, and communicate with their previous and next neighbors
+using reliable-connected queue pairs.
+
+All-Reduce is implemented as:
+
+```text
+All-Reduce = Reduce Scatter + All Gather
+```
+
+The implementation supports:
+
+- Two or more processes, with the exercise tested on 2 and 4.
+- `TYPE_INT32` and `TYPE_FP64`.
+- `OP_SUM` and `OP_PRODUCT`.
+- Eager communication using `IBV_WR_SEND`.
+- Rendezvous communication using `IBV_WR_RDMA_WRITE_WITH_IMM`.
+- Two-buffer pipelining with 64 KiB segments during Reduce Scatter.
+- Zero-copy Rendezvous All Gather directly into the final receive buffer.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Main["main.cpp<br/>test and benchmark"] --> Connect["connect_process_group"]
+    Connect --> Parse["parse_server_config"]
+    Connect --> Init["init_rdma_resources"]
+    Connect --> ConnectQPs["connect_qps"]
+
+    Init --> Device["RDMA device + context"]
+    Init --> PD["Protection domain"]
+    Init --> CQ["Completion queue"]
+    Init --> QPs["prev_qp + next_qp"]
+    Init --> Control["Registered control buffers"]
+
+    ConnectQPs --> TCP["TCP bootstrap"]
+    TCP --> Exchange["Exchange LID / QPN / PSN"]
+    Exchange --> QPState["QP states: INIT -> RTR -> RTS"]
+
+    Main --> AllReduce["pg_all_reduce"]
+    AllReduce --> Register["Register receive and staging buffers"]
+    Register --> ReduceScatter["Reduce Scatter: P - 1 steps"]
+    ReduceScatter --> Eager["Eager SEND / RECV"]
+    ReduceScatter --> Rendezvous["Rendezvous RDMA Write + Immediate"]
+    Eager --> Pipeline["64 KiB, depth-2 pipeline"]
+    Rendezvous --> Pipeline
+
+    Pipeline --> AllGather["All Gather: P - 1 steps"]
+    AllGather --> FinalBuffer["Complete result in recv_buf"]
+    FinalBuffer --> Release["Deregister temporary data buffers"]
+
+    Main --> Close["pg_close"]
+    Close --> Cleanup["Destroy QPs, CQ, MRs, PD, and context"]
+```
+
+Each process communicates only with its two ring neighbors:
+
+```mermaid
+flowchart LR
+    P0["Process 0"] --> P1["Process 1"]
+    P1 --> P2["Process 2"]
+    P2 --> PN["..."]
+    PN --> P0
+```
 
 ## Rendezvous Protocol
 
-Rendezvous is intended for larger messages.
+```mermaid
+sequenceDiagram
+    participant Sender
+    participant Receiver
 
-Instead of transferring the large message using SEND, the processes
-first exchange small control messages and then transfer the actual
-data using RDMA Write.
+    Sender->>Receiver: RENDEZVOUS_REQUEST(size)
+    Receiver->>Receiver: Post receive for Write-with-Immediate
+    Receiver-->>Sender: RENDEZVOUS_READY(address, rkey)
+    Sender->>Receiver: RDMA Write with Immediate
+    Sender->>Sender: Send completion
+    Receiver->>Receiver: Receive completion
+```
 
-Protocol:
+During pipelined Reduce Scatter, the next segment is posted before the current
+segment is reduced. Communication for segment `i + 1` can therefore progress
+while the CPU reduces segment `i`.
 
-    Sender                         Receiver
+## Files
 
-      | -------- REQUEST --------> |
-      |                            |
-      | <--- READY(addr, rkey) --- |
-      |                            |
-      | --- RDMA WRITE + IMM ----> |
+| File | Purpose |
+|---|---|
+| `allreduce.h` | Public datatypes, operations, and API declarations. |
+| `ex3n.cpp` | RDMA setup, protocols, collectives, and cleanup. |
+| `main.cpp` | Minimal correctness and timing test for both protocols. |
+| `Makefile` | Builds the `test` executable. |
+| `FUNCTION_GUIDE.md` | Function-by-function implementation guide. |
 
+## Requirements
 
-### `control_message`
+Build and run on Linux machines with RDMA hardware and:
 
-The control message contains:
+- GNU Make
+- A C++11 compiler
+- libibverbs headers and library
 
-- message type
-- message size
-- remote address
-- remote key
+On Debian or Ubuntu, the development package is normally:
 
-The currently defined message types are:
+```bash
+sudo apt install build-essential libibverbs-dev
+```
 
-- `RENDEZVOUS_REQUEST`
-- `RENDEZVOUS_READY`
-- `RENDEZVOUS_FIN`
+## Build
 
+```bash
+make
+```
 
-### `send_control_message()`
+This creates:
 
-Sends a small Rendezvous control message using `IBV_WR_SEND`.
+```text
+test
+```
 
+To remove the executable:
 
-### `wait_for_control_message()`
+```bash
+make clean
+```
 
-Posts a receive for a Rendezvous control message and waits until
-the expected message arrives.
+## Run
 
+Start one process on each listed machine. Every process must use the same host
+list and run the same tests in the same order.
 
-### `send_rendezvous()`
+### Two processes
 
-Sender side of the Rendezvous protocol.
+On `mlxstud01`:
 
-It:
+```bash
+./test -myindex 01 -list mlxstud01 mlxstud02
+```
 
-1. Sends `RENDEZVOUS_REQUEST` to NEXT.
-2. Waits for `RENDEZVOUS_READY`.
-3. Reads the destination address and rkey from the READY message.
-4. Transfers the actual data using `IBV_WR_RDMA_WRITE_WITH_IMM`.
+On `mlxstud02`:
 
+```bash
+./test -myindex 02 -list mlxstud01 mlxstud02
+```
 
-### `receive_rendezvous()`
+### Four processes
 
-Receiver side of the Rendezvous protocol.
+```bash
+# mlxstud01
+./test -myindex 01 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
 
-It:
+# mlxstud02
+./test -myindex 02 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
 
-1. Waits for `RENDEZVOUS_REQUEST` from PREV.
-2. Reads the incoming message size.
-3. Posts a receive WQE for the Write-with-Immediate notification.
-4. Sends `RENDEZVOUS_READY` containing the destination address
-   and rkey.
-5. Waits for the RDMA Write with Immediate to complete.
+# mlxstud03
+./test -myindex 03 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
 
+# mlxstud04
+./test -myindex 04 -list mlxstud01 mlxstud02 mlxstud03 mlxstud04
+```
 
-## Reduction
+The programs should be started close together because each client retries its
+TCP bootstrap connection for approximately ten seconds.
 
-### `datatype_size()`
+## Test Program
 
-Returns the size of the requested datatype:
+`main.cpp` runs the same `TYPE_INT32` and `OP_SUM` test twice:
 
-- `TYPE_INT`
-- `TYPE_FLOAT`
-- `TYPE_DOUBLE`
+1. `ALLREDUCE_PROTOCOL=eager`
+2. `ALLREDUCE_PROTOCOL=rendezvous`
 
+Process rank `r` fills its input with `r + 1`. For `P` processes, every result
+element must equal:
 
-### `reduce()`
+```text
+P * (P + 1) / 2
+```
 
-Performs the local reduction between two buffers.
+Each process contributes 65,536 elements per ring chunk. Every chunk is
+256 KiB and is divided into four 64 KiB segments, so the test exercises the
+pipeline.
 
-Supported operations:
+Example rank-zero output:
 
-- `OP_SUM`
-- `OP_MAX`
-- `OP_MIN`
-
-Supported datatypes:
-
-- int
-- float
-- double
-
-The result is written directly into the destination buffer.
-
-Example:
-
-    dst = [1, 5, 3]
-    src = [4, 2, 7]
-    op  = SUM
-
-Result:
-
-    dst = [5, 7, 10]
-
-
-## Planned Ring AllReduce
-
-The final algorithm will use:
-
-    AllReduce = Reduce Scatter + All Gather
-
-
-### Reduce Scatter
-
-The input buffer will be divided into chunks according to the number
-of processes.
-
-During each ring step:
-
-1. Send a chunk to NEXT.
-2. Receive a chunk from PREV.
-3. Reduce the received data into the corresponding local chunk.
-
-After `P - 1` steps, each process owns one fully reduced chunk.
-
-A staging buffer will be used for received data before applying
-`reduce()`.
-
-
-### All Gather
-
-After Reduce Scatter, each process owns one part of the final result.
-
-The All Gather phase circulates these reduced chunks around the ring
-until every process has all chunks.
-
-After `P - 1` steps, every process contains the complete reduced
-buffer.
-
-
-### Zero-Copy
-
-For large messages during All Gather, the plan is to use Rendezvous
-and RDMA Write directly into the correct location in the final
-receive buffer.
-
-This avoids copying the received data through an intermediate buffer.
-
-
-### Pipelining
-
-The Reduce Scatter phase will be divided into smaller segments so
-that communication and reduction can overlap.
-
-This will be implemented after the basic Ring AllReduce is working
-correctly.
-
+```text
+eager: PASS, 1.23 ms
+rendezvous: PASS, 0.87 ms
+```
 
 ## Public API
 
-The required API is:
+```cpp
+int connect_process_group(char *servername, void **pg_handle);
 
-    int connect_process_group(char *servername, void **pg_handle);
+int pg_all_reduce(void *send_buf,
+                  void *recv_buf,
+                  int count,
+                  DATATYPE datatype,
+                  OPERATION op,
+                  void *pg_handle);
 
-    int pg_all_reduce(void *sendbuf,
-                      void *recvbuf,
-                      int count,
-                      DATATYPE datatype,
-                      OPERATION op,
-                      void *pg_handle);
+int pg_close(void *pg_handle);
+```
 
-    int pg_close(void *pg_handle);
+`pg_all_reduce` requires `count` to be divisible by the number of processes.
+The `ALLREDUCE_PROTOCOL` environment variable must be either `eager` or
+`rendezvous`; if it is unset, Eager is used.
 
+## Current Constraints
 
-## Next Step
+- TCP bootstrap uses fixed port `18515`.
+- RDMA port 1 and LID-based InfiniBand addressing are used.
+- All machines are expected to have compatible architectures.
+- Completion polling is busy-wait based.
+- All processes must call collectives in the same order with identical
+  arguments.
 
-The next implementation step is `reduce_scatter()`.
-
-The communication infrastructure, Eager/Rendezvous protocols, and
-local reduction operation are now in place, so Reduce Scatter will
-connect these components into the first phase of the Ring AllReduce
-algorithm.
+See [FUNCTION_GUIDE.md](FUNCTION_GUIDE.md) for implementation details.

@@ -1,4 +1,6 @@
 #include <infiniband/verbs.h>
+#include "allreduce.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,22 +27,6 @@
 #define WR_PIPELINE_RECV_BASE 1000
 #define WR_PIPELINE_SEND_BASE 2000
 
-// Types Required by the API
-
-// Indication for send_buf type
-enum DATATYPE
-{
-    TYPE_INT32,
-    TYPE_FP64
-};
-
-// which reduction action to preform
-enum OPERATION
-{
-    OP_SUM,
-    OP_PRODUCT
-};
-
 enum PROTOCOL
 {
     PROTOCOL_EAGER,
@@ -65,6 +51,11 @@ typedef enum
     WR_RDMA_WRITE,
     WR_RDMA_WRITE_RECV
 } wr_type;
+
+static uint64_t make_rendezvous_wr_id(wr_type type, uint64_t sequence)
+{
+    return (static_cast<uint64_t>(type) << 56) | sequence;
+}
 
 //
 struct control_message
@@ -853,7 +844,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
 }
 
 /* Cleanup */
-int pg_close(void *pg_handle)
+extern "C" int pg_close(void *pg_handle)
 {
     struct process_group *pg = (struct process_group *)pg_handle;
 
@@ -898,7 +889,7 @@ int pg_close(void *pg_handle)
 }
 
 /* API- connect all processes into a ring */
-int connect_process_group(char *servername, void **pg_handle)
+extern "C" int connect_process_group(char *servername, void **pg_handle)
 {
     if (!servername || !pg_handle)
         return -1;
@@ -1152,9 +1143,12 @@ static int send_control_message(struct process_group *pg,
 }
 
 /* Rendezvous */
-static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
+static int begin_send_rendezvous(struct process_group *pg,
+                                 void *buffer,
+                                 size_t size,
+                                 struct ibv_mr *mr,
+                                 uint64_t wr_id)
 {
-
     if (send_control_message(pg, pg->next_qp, RENDEZVOUS_REQUEST, size, 0, 0))
         return -1;
 
@@ -1179,7 +1173,7 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     /* Create SEND Work Request */
     struct ibv_send_wr wr = {};
 
-    wr.wr_id = WR_RDMA_WRITE;
+    wr.wr_id = wr_id;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -1199,8 +1193,14 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
         return -1;
     }
 
-    struct ibv_wc wc;
-    if (wait_for_completion(pg, WR_RDMA_WRITE, &wc))
+    return 0;
+}
+
+static int finish_send_rendezvous(struct process_group *pg, uint64_t wr_id)
+{
+    struct ibv_wc wc = {};
+
+    if (wait_for_completion(pg, wr_id, &wc))
         return -1;
 
     if (wc.opcode != IBV_WC_RDMA_WRITE)
@@ -1209,41 +1209,57 @@ static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, 
     return 0;
 }
 
-static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buffer_size, struct ibv_mr *mr)
+static int send_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
 {
-    // Receive request from PREV
+    const uint64_t wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, 0);
+
+    if (begin_send_rendezvous(pg, buffer, size, mr, wr_id))
+        return -1;
+
+    return finish_send_rendezvous(pg, wr_id);
+}
+
+static int begin_receive_rendezvous(struct process_group *pg,
+                                    void *buffer,
+                                    size_t size,
+                                    struct ibv_mr *mr,
+                                    uint64_t wr_id)
+{
     if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
         return -1;
 
-    size_t incoming_size = pg->control_recv_buffer->size;
-    if (incoming_size != buffer_size)
+    if (pg->control_recv_buffer->size != size)
     {
-        fprintf(stderr, "Rendezvous message size mismatch\n");
+        fprintf(stderr, "Rendezvous request size mismatch\n");
         return -1;
     }
 
-    // Post a receive WQE for WRITE_WITH_IMM
-    struct ibv_recv_wr recv_wr = {};
-    recv_wr.wr_id = WR_RDMA_WRITE_RECV;
-    recv_wr.sg_list = NULL;
-    recv_wr.num_sge = 0;
+    struct ibv_recv_wr wr = {};
+    wr.wr_id = wr_id;
+    wr.num_sge = 0;
+    wr.sg_list = NULL;
 
-    struct ibv_recv_wr *bad_recv_wr = NULL;
+    struct ibv_recv_wr *bad_wr = NULL;
 
-    if (ibv_post_recv(pg->prev_qp, &recv_wr, &bad_recv_wr))
+    if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
     {
         fprintf(stderr, "Failed to post rendezvous receive\n");
         return -1;
     }
 
-    // Tell PREV where to write
-    if (send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, incoming_size, (uint64_t)buffer, mr->rkey))
-        return -1;
+    return send_control_message(pg,
+                                pg->prev_qp,
+                                RENDEZVOUS_READY,
+                                size,
+                                (uint64_t)(uintptr_t)buffer,
+                                mr->rkey);
+}
 
-    // Wait for the RDMA Write notification
-    struct ibv_wc wc;
+static int finish_receive_rendezvous(struct process_group *pg, uint64_t wr_id)
+{
+    struct ibv_wc wc = {};
 
-    if (wait_for_completion(pg, WR_RDMA_WRITE_RECV, &wc))
+    if (wait_for_completion(pg, wr_id, &wc))
         return -1;
 
     if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM)
@@ -1255,38 +1271,14 @@ static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buf
     return 0;
 }
 
-static int begin_receive_rendezvous(struct process_group *pg, void *buffer, size_t size, struct ibv_mr *mr)
+static int receive_rendezvous(struct process_group *pg, void *buffer, size_t buffer_size, struct ibv_mr *mr)
 {
-    if (wait_for_control_message(pg, pg->prev_qp, RENDEZVOUS_REQUEST))
-        return -1;
-    if (pg->control_recv_buffer->size != size)
-    {
-        fprintf(stderr, "Rendezvous request size mismatch\n");
-        return -1;
-    }
+    const uint64_t wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, 0);
 
-    struct ibv_recv_wr wr = {};
-    wr.wr_id = WR_RDMA_WRITE_RECV;
-    wr.num_sge = 0;
-    wr.sg_list = NULL;
-
-    struct ibv_recv_wr *bad_wr = NULL;
-    if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
+    if (begin_receive_rendezvous(pg, buffer, buffer_size, mr, wr_id))
         return -1;
 
-    return send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, size, (uint64_t)(uintptr_t)buffer, mr->rkey);
-}
-
-static int finish_receive_rendezvous(struct process_group *pg)
-{
-    struct ibv_wc wc = {};
-    if (wait_for_completion(pg, WR_RDMA_WRITE_RECV, &wc))
-        return -1;
-
-    if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM)
-        return -1;
-
-    return 0;
+    return finish_receive_rendezvous(pg, wr_id);
 }
 
 /* Reduce Scatter */
@@ -1380,55 +1372,67 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
                 continue;
 
             const size_t first_bytes = chunk_bytes < SEGMENT_SIZE ? chunk_bytes : SEGMENT_SIZE;
+            const uint64_t first_send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, 0);
+            const uint64_t first_recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, 0);
 
             if (pid % 2 == 0)
             {
-                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr))
+                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr, first_recv_wr_id))
                     return -1;
 
-                if (send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr))
+                if (begin_send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr, first_send_wr_id))
                     return -1;
             }
             else
             {
-                if (send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr))
+                if (begin_send_rendezvous(pg, send_ptr, first_bytes, pg->recv_mr, first_send_wr_id))
                     return -1;
-                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr))
+                if (begin_receive_rendezvous(pg, staging, first_bytes, pg->staging_mr, first_recv_wr_id))
                     return -1;
             }
+
             for (size_t segment = 0; segment < num_segments; ++segment)
             {
                 const size_t offset = segment * SEGMENT_SIZE;
 
                 const size_t bytes = chunk_bytes - offset < SEGMENT_SIZE ? chunk_bytes - offset : SEGMENT_SIZE;
                 char *current_staging = staging + (segment % PIPELINE_DEPTH) * SEGMENT_SIZE;
+                const uint64_t send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, segment);
+                const uint64_t recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, segment);
 
-                if (finish_receive_rendezvous(pg))
+                if (finish_receive_rendezvous(pg, recv_wr_id))
                     return -1;
 
                 if (segment + 1 < num_segments)
                 {
-                    const size_t next_offset = (segment + 1) * SEGMENT_SIZE;
+                    const size_t next_segment = segment + 1;
+                    const size_t next_offset = next_segment * SEGMENT_SIZE;
                     const size_t next_bytes = (chunk_bytes - next_offset < SEGMENT_SIZE) ? chunk_bytes - next_offset : SEGMENT_SIZE;
 
-                    char *next_staging = staging + ((segment + 1) % PIPELINE_DEPTH) * SEGMENT_SIZE;
+                    char *next_staging = staging + (next_segment % PIPELINE_DEPTH) * SEGMENT_SIZE;
+                    const uint64_t next_send_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE, next_segment);
+                    const uint64_t next_recv_wr_id = make_rendezvous_wr_id(WR_RDMA_WRITE_RECV, next_segment);
 
                     if (pid % 2 == 0)
                     {
-                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr))
+                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr, next_recv_wr_id))
                             return -1;
-                        if (send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr))
+                        if (begin_send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, next_send_wr_id))
                             return -1;
                     }
                     else
                     {
-                        if (send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr))
+                        if (begin_send_rendezvous(pg, send_ptr + next_offset, next_bytes, pg->recv_mr, next_send_wr_id))
                             return -1;
-                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr))
+                        if (begin_receive_rendezvous(pg, next_staging, next_bytes, pg->staging_mr, next_recv_wr_id))
                             return -1;
                     }
                 }
+
                 reduce(recv_ptr + offset, current_staging, (int)(bytes / elem_size), datatype, op);
+
+                if (finish_send_rendezvous(pg, send_wr_id))
+                    return -1;
             }
         }
         else
@@ -1531,7 +1535,7 @@ static int all_gather(struct process_group *pg, void *recv_buffer, int count, DA
 }
 
 /* All Reduce */
-int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, OPERATION op, void *pg_handle)
+extern "C" int pg_all_reduce(void *send_buf, void *recv_buf, int count, DATATYPE datatype, OPERATION op, void *pg_handle)
 {
     struct process_group *pg = (struct process_group *)pg_handle;
 
