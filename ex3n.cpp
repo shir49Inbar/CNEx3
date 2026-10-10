@@ -147,7 +147,8 @@ static size_t datatype_size(DATATYPE datatype)
     }
 }
 
-template<typename T> static void reduce_typed(T *dst, const T *src, int count, OPERATION op)
+template <typename T>
+static void reduce_typed(T *dst, const T *src, int count, OPERATION op)
 {
     for (int i = 0; i < count; ++i)
     {
@@ -838,7 +839,7 @@ static int parse_server_config(const char *config, int *rank, std::vector<std::s
     while (input >> host)
         servers->push_back(host);
 
-    if (servers->size() != 2 && servers->size() != 4)
+    if (servers->size() < 2)
         return -1;
 
     if (one_based)
