@@ -1273,7 +1273,7 @@ static int begin_receive_rendezvous(struct process_group *pg, void *buffer, size
     if (ibv_post_recv(pg->prev_qp, &wr, &bad_wr))
         return -1;
 
-    return send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, size, (uint64_t)(uintptr)buffer, mr->rkey);
+    return send_control_message(pg, pg->prev_qp, RENDEZVOUS_READY, size, (uint64_t)(uintptr_t)buffer, mr->rkey);
 }
 
 static int finish_receive_rendezvous(struct process_group *pg)
@@ -1349,7 +1349,7 @@ static int reduce_scatter(struct process_group *pg, void *buffer, int count, DAT
 
                     const size_t next_offset = next_segment * SEGMENT_SIZE;
 
-                    const size_t next_bytes = chunk_bytes - next_offset < SEGMENT_SIZE ? chunk_bytes - next_offset : SEGMENT_SIZE;
+                    const size_t next_bytes = (chunk_bytes - next_offset < SEGMENT_SIZE) ? chunk_bytes - next_offset : SEGMENT_SIZE;
 
                     char *next_staging = staging + next_slot * SEGMENT_SIZE;
 
