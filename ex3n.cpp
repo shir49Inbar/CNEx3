@@ -625,7 +625,7 @@ static int tcp_client_exchange(const char *servername, int port, const struct rd
 
     int sockfd = -1;
 
-    for (int attempt = 0; attempt < 100; ++attempt)
+    for (int attempt = 0; attempt < 600; ++attempt)
     {
         sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 

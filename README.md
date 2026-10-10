@@ -163,7 +163,7 @@ On `mlxstud02`:
 ```
 
 The programs should be started close together because each client retries its
-TCP bootstrap connection for approximately ten seconds.
+TCP bootstrap connection for approximately one minute.
 
 ## Test Program
 
